@@ -278,8 +278,10 @@ def clear_box(box) -> None:
 
 class DeviceList(Gtk.Box):
     """Block devices as a selectable table."""
-    COLS = (("Device", 16, False), ("Size", 9, False), ("Type", 5, False), ("Model / Label", 24, True),
-            ("FS", 10, False), ("Used", 13, False), ("Bus", 7, False), ("Status", 18, True))
+    # (title, minimum width in characters, expands): narrow minimums so that the window also fits
+    # small screens (e.g. 1024 px on the rescue USB); long texts are shortened with "…"
+    COLS = (("Device", 11, False), ("Size", 8, False), ("Type", 4, False), ("Model / Label", 8, True),
+            ("FS", 6, False), ("Used", 9, False), ("Bus", 5, False), ("Status", 8, False))
 
     def __init__(self, on_select):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -299,8 +301,10 @@ class DeviceList(Gtk.Box):
 
     def _row_box(self, cells, markup=False) -> Gtk.Box:
         box = Gtk.Box(spacing=8, margin_top=4, margin_bottom=4, margin_end=8)
-        for (name, width, ell), g, txt in zip(self.COLS, self.groups, cells):
-            lb = label(txt, markup=markup, width=width, ellipsize=ell or True)
+        for (name, width, expand), g, txt in zip(self.COLS, self.groups, cells):
+            lb = label(txt, markup=markup, ellipsize=True, hexpand=expand)
+            lb.set_width_chars(width)
+            lb.set_max_width_chars(40 if expand else width + 6)
             g.add_widget(lb)
             box.append(lb)
         return box
@@ -355,8 +359,7 @@ class DeviceList(Gtk.Box):
             row.path = d["path"]
             if d["path"] == selected:
                 row.add_css_class("accent")
-            if d["busy"]:
-                row.set_tooltip_text(d["busy"])
+            row.set_tooltip_text(d["busy"] or d["long"])
             self.lb.append(row)
 
     def set_usage(self, path: str, text: str) -> None:
@@ -655,7 +658,7 @@ class SetupPage(Gtk.Box):
 
         # ---- sidebar: modes + options
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_start=12, margin_end=12,
-                       margin_top=12, margin_bottom=12, width_request=330)
+                       margin_top=12, margin_bottom=12, width_request=290)
         self.modes = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.modes.add_css_class("navigation-sidebar")
         self.mode_rows = {}
@@ -1910,12 +1913,14 @@ class MainWindow(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        super().__init__(application_id=os.environ.get("DISKIMG_APP_ID") or APP_ID,
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.win: MainWindow | None = None
 
     def do_activate(self) -> None:
         if self.win is None:
             self.win = MainWindow(self)
+            self.set_accels_for_action("window.close", ["<Control>q", "<Control>w"])
         self.win.present()
 
 

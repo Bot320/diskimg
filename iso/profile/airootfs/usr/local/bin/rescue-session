@@ -1,0 +1,66 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Graphical session of the rescue USB, started on tty1 by the live user's ~/.bash_profile.
+# Runs the start menu full screen in the cage kiosk compositor and restarts it when needed:
+#   exit code 10 from the start menu = restart (new keyboard layout)
+#   cage fails to start = retry with software rendering, then fall back to the text menu
+#   boot option rescue.text=1 = text menu only
+set -u
+export XDG_CURRENT_DESKTOP=rescue
+export GTK_USE_PORTAL=0
+export NO_AT_BRIDGE=1
+export WLR_NO_HARDWARE_CURSORS=1
+state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/rescue-kbd"
+
+cmdline_value() {          # value of key=... on the kernel command line
+    local a
+    for a in $(cat /proc/cmdline); do
+        case "$a" in "$1"=*) echo "${a#*=}"; return 0 ;; esac
+    done
+    return 1
+}
+
+console_keymap() {         # XKB layout -> console keymap
+    case "$1" in
+        de) echo de-latin1 ;; ch) echo de_CH-latin1 ;; gb) echo uk ;; fr) echo fr-latin1 ;;
+        *) echo "$1" ;;
+    esac
+}
+
+[ -s "$state" ] || (cmdline_value rescue.kbd || echo de) > "$state"
+if cmdline_value rescue.text >/dev/null; then
+    /usr/local/bin/rescue-text-menu      # returns when the user picks the graphical start screen
+fi
+
+fails=0
+renderer=""
+while true; do
+    layout=$(tr -cd 'a-z_' < "$state")
+    [ -n "$layout" ] || layout=de
+    export XKB_DEFAULT_LAYOUT="$layout"
+    sudo -n loadkeys -q "$(console_keymap "$layout")" 2>/dev/null
+    if [ -n "$renderer" ]; then
+        export WLR_RENDERER="$renderer" GSK_RENDERER=cairo
+    fi
+    start=$(date +%s)
+    dbus-run-session -- cage -s -- /usr/local/bin/rescue-launcher
+    rc=$?
+    if [ "$rc" -eq 10 ]; then
+        fails=0
+        continue
+    fi
+    if [ $(( $(date +%s) - start )) -lt 20 ]; then
+        fails=$((fails + 1))
+    else
+        fails=0
+    fi
+    if [ "$fails" -eq 1 ] && [ -z "$renderer" ]; then
+        renderer=pixman          # no usable GPU driver: software rendering
+    elif [ "$fails" -ge 2 ]; then
+        echo "The graphical start screen could not be started (code $rc)."
+        /usr/local/bin/rescue-text-menu
+        fails=0
+        renderer=""
+    fi
+    sleep 1
+done

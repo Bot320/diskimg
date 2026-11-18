@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+/iso/out/
+/packaging/*.pkg.tar.zst
+/packaging/src/
+/packaging/pkg/

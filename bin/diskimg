@@ -21,6 +21,17 @@ as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -- "$@"; fi
 }
 
+packaged=0
+pacman -Qqo "$SELF" >/dev/null 2>&1 && packaged=1     # installed as a pacman package
+
+case "${1:-}" in
+    --update|--uninstall)
+        if [ "$packaged" -eq 1 ]; then
+            echo "diskimg was installed as a pacman package: use pacman to update or remove it." >&2
+            exit 1
+        fi ;;
+esac
+
 case "${1:-}" in
     -h|--help) usage; exit 0 ;;
     -V|--version) exec "${RUN[@]}" version ;;

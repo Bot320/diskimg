@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["DISKIMG_HELPER_TEST"] = "1"
+os.environ["DISKIMG_APP_ID"] = "io.github.bot320.diskimg.Test"   # never talk to an installed, running copy
 _rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 _n = 40 + os.getpid() % 50
 while os.path.exists(f"{_rt}/broadway{_n + 1}.socket"):     # display :N uses broadway{N+1}.socket

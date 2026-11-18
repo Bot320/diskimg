@@ -1,0 +1,2 @@
+# Rescue USB: the live user may run everything as root without a password (like root on the Arch ISO)
+live ALL=(ALL:ALL) NOPASSWD: ALL

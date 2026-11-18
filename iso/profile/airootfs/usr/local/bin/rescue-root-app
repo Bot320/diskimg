@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Start a graphical program as root inside the kiosk session (the live user has passwordless sudo).
+# Root may use the live user's Wayland socket; the environment says where it is. Settings stay in
+# memory so that root never creates files in the live user's runtime folder.
+exec sudo --preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XKB_DEFAULT_LAYOUT,GDK_BACKEND,GSK_RENDERER -- \
+    env GSETTINGS_BACKEND=memory NO_AT_BRIDGE=1 "$@"

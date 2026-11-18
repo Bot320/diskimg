@@ -61,6 +61,21 @@ diskimg --version
 Every backup folder (`*.dimg`) contains an `info.txt` that explains how to restore it by hand,
 plus `SHA256SUMS`.
 
+## Rescue USB (bootable ISO)
+
+`iso/` builds a bootable rescue stick (UEFI and BIOS). It starts straight into a full-screen start
+menu with **diskimg**, **BootRepair** (Windows boot repair), **GParted**, a file manager and a
+terminal, plus Wi-Fi, keyboard layout (German by default) and power buttons. Nothing is installed
+on the computer; everything runs from the stick and RAM.
+
+```sh
+sudo pacman -S archiso      # once
+iso/build.sh                # as a normal user; result in iso/out/
+```
+
+Write the ISO to a stick with `dd`, or copy it onto a Ventoy stick. Secure Boot must be switched
+off. Boot menu: German or English keyboard, "copy to RAM" (the stick can be removed), and text mode.
+
 ## How it is built
 
 | Part | Runs as | Purpose |

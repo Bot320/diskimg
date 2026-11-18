@@ -1,0 +1,22 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Text-mode menu of the rescue USB (boot option "text mode", or when graphics do not work).
+while true; do
+    printf '\n\033[1mRescue USB - text mode\033[0m\n\n'
+    echo "  1) diskimg (backups, text interface)"
+    echo "  2) Command line (sudo works without a password)"
+    echo "  3) Network setup (nmtui)"
+    echo "  4) Try the graphical start screen"
+    echo "  5) Restart"
+    echo "  6) Shut down"
+    echo
+    read -r -p "Choice: " c || exit 0
+    case "$c" in
+        1) sudo diskimg --tui ;;
+        2) echo "Type 'exit' to return to this menu."; bash -i ;;
+        3) nmtui ;;
+        4) exit 0 ;;
+        5) systemctl reboot ;;
+        6) systemctl poweroff ;;
+    esac
+done
