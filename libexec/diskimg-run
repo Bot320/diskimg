@@ -1,0 +1,50 @@
+#!/usr/bin/python3 -I
+"""Entry point for all diskimg processes: diskimg-run {gui|tui|helper|serve-chunks|extract|version}.
+Started with -I (isolated mode): the current directory and user site-packages are never on the
+module path, which matters because most subcommands run as root."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    cmd = args[0] if args else "tui"
+    rest = args[1:]
+    if cmd in ("serve-chunks", "--serve-chunks"):
+        from diskimg.engine import serve_chunks, set_c_locale
+        set_c_locale()
+        return serve_chunks(rest[0], rest[1:]) if rest else 2
+    if cmd in ("extract", "--extract"):
+        from pathlib import Path
+        from diskimg.engine import chunked_extract
+        if len(rest) != 3:
+            print("usage: diskimg --extract DATA.chunks INDEX.cidx OUT.img", file=sys.stderr)
+            return 2
+        chunked_extract(Path(rest[0]), Path(rest[1]), Path(rest[2]))
+        print(f"extracted to {rest[2]}")
+        return 0
+    if cmd in ("version", "--version"):
+        from diskimg.engine import VERSION
+        print(f"diskimg {VERSION}")
+        return 0
+    if cmd == "helper":
+        from diskimg.helper import main as helper_main
+        return helper_main(rest)
+    if cmd == "gui":
+        try:
+            from diskimg.gui import main as gui_main
+        except (ImportError, ValueError) as e:      # no PyGObject / GTK 4 / libadwaita
+            print(f"diskimg: graphical interface unavailable: {e}", file=sys.stderr)
+            return 3
+        return gui_main(rest)
+    if cmd == "tui":
+        from diskimg.tui import main as tui_main
+        return tui_main(rest)
+    print(f"diskimg-run: unknown command {cmd!r}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

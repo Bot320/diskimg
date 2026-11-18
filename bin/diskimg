@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# diskimg - disk imaging for Arch Linux.
+#
+#   diskimg              graphical interface on a desktop, otherwise the text interface
+#   diskimg --gui        graphical interface (runs as you; asks for the admin password itself)
+#   diskimg --tui        text interface (runs as root; also works without a desktop / live ISO)
+#   diskimg --update     install the newest version from GitHub
+#   diskimg --uninstall  remove diskimg (settings in /etc/diskimg are kept)
+#   diskimg --extract DATA.chunks INDEX.cidx OUT.img   rebuild a partition image by hand
+#   diskimg --version
+set -u
+SELF=$(readlink -f -- "$0")
+ROOT=$(dirname -- "$(dirname -- "$SELF")")
+RUN=(/usr/bin/python3 -I "$ROOT/libexec/diskimg-run")
+INSTALLER_URL="https://raw.githubusercontent.com/Bot320/diskimg/main/install.sh"
+
+usage() { sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -- "$@"; fi
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) exec "${RUN[@]}" version ;;
+    --extract) shift; exec "${RUN[@]}" extract "$@" ;;
+    --update)
+        tmp=$(mktemp) || exit 1
+        if curl -fsSL "$INSTALLER_URL" -o "$tmp"; then
+            as_root bash "$tmp" --update; rc=$?
+        else
+            echo "diskimg: could not download the installer; using the installed copy." >&2
+            as_root bash "$ROOT/install.sh" --update; rc=$?
+        fi
+        rm -f "$tmp"; exit $rc ;;
+    --uninstall) as_root bash "$ROOT/install.sh" --uninstall; exit $? ;;
+esac
+
+want=auto
+case "${1:-}" in
+    --tui) want=tui; shift ;;
+    --gui) want=gui; shift ;;
+esac
+
+if [ "$want" != tui ] && [ "$(id -u)" -ne 0 ] && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    "${RUN[@]}" gui "$@"
+    rc=$?
+    [ "$rc" -ne 3 ] && exit "$rc"        # 3 = no usable GTK 4 / libadwaita: fall back
+    echo "diskimg: the graphical interface is not available, starting the text interface." >&2
+elif [ "$want" = gui ]; then
+    echo "diskimg: no graphical session found (or running as root); starting the text interface." >&2
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -- "$SELF" --tui "$@"
+fi
+exec "${RUN[@]}" tui "$@"

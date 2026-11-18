@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=diskimg
+GenericName=Disk Imaging
+Comment=Back up, restore, clone, check and browse disks and partitions
+Exec=diskimg --gui
+Icon=io.github.bot320.diskimg
+Terminal=false
+Categories=System;GTK;
+Keywords=backup;image;clone;restore;ddrescue;partclone;disk;partition;restic;
+StartupNotify=true
