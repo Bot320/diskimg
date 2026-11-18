@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """Privileged backend for the GTK user interface.
 
 The GUI runs as the desktop user and starts this process with pkexec. They talk over the helper's

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """diskimg GTK4 / libadwaita user interface.
 
 Runs as the desktop user. Everything that needs root (reading and writing disks, mounting) is done
@@ -1720,7 +1721,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     def about(self) -> None:
         a = Adw.AboutDialog(application_name="diskimg", version=E.VERSION, application_icon=APP_ID,
-                            developer_name="diskimg contributors", license_type=Gtk.License.UNKNOWN,
+                            developer_name="Bot320 and contributors", license_type=Gtk.License.GPL_3_0_ONLY,
+                            copyright="© 2026 Bot320 and contributors",
                             comments="Disk imaging for Arch Linux: raw and filesystem-aware images, "
                                      "compression, encryption, network shares, instant browsing and "
                                      "file backups.",

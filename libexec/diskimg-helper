@@ -1,4 +1,5 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-only
 """Privileged backend of the diskimg GUI. Started by the GUI through pkexec (polkit action
 io.github.bot320.diskimg.helper); speaks JSON lines on stdin/stdout. Not meant to be run by hand."""
 import os

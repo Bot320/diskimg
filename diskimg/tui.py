@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """diskimg text user interface (Textual). Runs as root; also the fallback when no GUI is available."""
 from __future__ import annotations
 

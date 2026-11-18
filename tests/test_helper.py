@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """Protocol test of the root helper, run as a normal user in test mode (DISKIMG_HELPER_TEST=1).
 Usage: python3 -I tests/test_helper.py [BACKUP.dimg]"""
 import json

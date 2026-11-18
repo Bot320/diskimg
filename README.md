@@ -93,3 +93,13 @@ Arch Linux with its current Python (tested with 3.14, which brings zstd; on olde
 plus `python-textual`, `ddrescue`, `gptfdisk`, `partclone`, `ntfs-3g`, `zstd`, `gnupg`,
 `cifs-utils`, `nfs-utils`, `restic`, `fuse3`, `python-pyfuse3`, and for the window
 `python-gobject`, `gtk4`, `libadwaita` (≥ 1.6) and `polkit`. The installer handles all of this.
+
+## License
+
+Copyright © 2026 Bot320 and contributors.
+
+diskimg is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License, version 3 (GPL-3.0-only), as published by the Free Software
+Foundation. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See [LICENSE](LICENSE) for the full text.

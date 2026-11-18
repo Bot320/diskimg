@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """Headless GUI test (GTK Broadway backend, helper in non-root test mode).
 Usage:  python3 -I tests/test_gui.py [BACKUP.dimg]
 Starts gtk4-broadwayd on a free display, opens the app, walks through all pages and dialogs, and
@@ -98,6 +99,10 @@ def main() -> int:
         check(wait(lambda: "name" in win.files.msg.get_text().lower(), 10),
               f"file set validation: {win.files.msg.get_text()}")
         win.show_setup()
+        win.about()
+        check(wait(lambda: visible_dialog(win) is not None, 5), "About dialog (GPL-3.0) opens")
+        visible_dialog(win).force_close()
+        wait(lambda: visible_dialog(win) is None, 5)
         # passphrase dialog: wrong then right
         res = {}
         G.passphrase_dialog(win, new=False, checker=lambda x: _done(x == "s3cret!!")).then(

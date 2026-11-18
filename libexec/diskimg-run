@@ -1,4 +1,5 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-only
 """Entry point for all diskimg processes: diskimg-run {gui|tui|helper|serve-chunks|extract|version}.
 Started with -I (isolated mode): the current directory and user site-packages are never on the
 module path, which matters because most subcommands run as root."""

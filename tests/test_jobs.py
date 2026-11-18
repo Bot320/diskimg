@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """End-to-end tests of the job engine that run WITHOUT root: regular files stand in for
 partitions. Run:  python3 -I tests/test_jobs.py [WORKDIR]   (WORKDIR must not be on tmpfs)."""
 import hashlib

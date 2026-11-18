@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """Headless smoke test of the text UI (no root needed; nothing is written to disks).
 Run: python3 -I tests/test_tui.py"""
 import asyncio

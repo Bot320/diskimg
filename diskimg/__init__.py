@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """diskimg - disk imaging for Arch Linux: raw and filesystem-aware images (ddrescue, partclone),
 zstd compression, gpg encryption, SMB/NFS shares, instant browsing, restic file backups.
 

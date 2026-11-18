@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 """diskimg engine: devices, image formats, network shares, and the job runner.
 Everything here is independent of the user interface (text UI or GTK)."""
 from __future__ import annotations

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # diskimg installer and updater (Arch Linux, also the Arch live ISO).
 #
 #   Install or update (same command):
@@ -37,7 +38,7 @@ for a in "$@"; do
         --update|--install) mode=install ;;
         --uninstall) mode=uninstall ;;
         --local) local_src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) ;;
-        -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,14p' "${BASH_SOURCE[0]}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $a" ;;
     esac
 done
@@ -131,6 +132,7 @@ for d in diskimg libexec bin data; do
 done
 cp "$src/install.sh" "$P.new/"
 [ -f "$src/README.md" ] && cp "$src/README.md" "$P.new/"
+[ -f "$src/LICENSE" ] && cp "$src/LICENSE" "$P.new/"
 find "$P.new" -name '__pycache__' -prune -exec rm -rf {} +
 # everything root-owned and not writable by others: the helper runs as root
 chown -R root:root "$P.new"
