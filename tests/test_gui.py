@@ -76,6 +76,22 @@ def main() -> int:
                   f"('{s.summary.get_text()[:60]}')")
         s.set_mode("d2i")
         wait(lambda: False, 0.8)
+        # selection: several sources in Disk -> Image, click again unselects
+        free = [d["path"] for d in s.devs if d["selectable"] and not d["busy"] and not d["has_children"]]
+        if len(free) >= 2:
+            s.select_dev("src", free[0])
+            s.select_dev("src", free[1])
+            check(s.src_sels == free[:2], f"two sources selected: {s.src_sels}")
+            check("folder" in s.dst_title.get_text(), f"title: {s.dst_title.get_text()}")
+            s.select_dev("src", free[0])
+            check(s.src_sels == free[1:2], "clicking a selected source again unselects it")
+            s.select_dev("src", free[1])
+            check(s.src_sels == [], "nothing selected")
+        s.device_menu(s.devs[0]["path"], s.src_devs.lb, 10, 10)
+        wait(lambda: False, 0.4)
+        check(getattr(s, "last_menu", None) is not None and s.last_menu.get_visible(), "right-click menu opens")
+        s.last_menu.popdown()
+        check(s.src_devs.COLS[3][0] == "Label", "Label column")
         check(s.dst_path.get_text().startswith("/mnt/"), f"default backup name: {s.dst_path.get_text()}")
         # options visibility follows the engine
         s.comp.set_selected(2)

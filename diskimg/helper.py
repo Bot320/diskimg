@@ -103,6 +103,9 @@ class HelperSink(E.JobSink):
     def button(self, name: str, enabled: bool) -> None:
         self.ch.event("button", name=name, enabled=enabled)
 
+    def begin(self, info: dict) -> None:
+        self.ch.event("begin", info=info)
+
 
 def dev_dict(d: E.Dev) -> dict:
     return {"path": d.path, "name": d.name, "kind": d.kind, "size": d.size, "model": d.model,
@@ -278,10 +281,10 @@ class Helper:
         return True
 
     # ------------------------------------------------------------ planning
-    def _plan(self, plan: dict) -> E.Job:
+    def _plan(self, plan: dict) -> list[E.Job]:
         with self.lock:
             devs = dict(self.devs)
-        return E.plan_job(E.PlanInput.from_dict(plan), devs)
+        return E.plan_jobs(E.PlanInput.from_dict(plan), devs)
 
     def cmd_plan(self, plan: dict) -> dict:
         pi = E.PlanInput.from_dict(plan)
@@ -289,30 +292,37 @@ class Helper:
                "label": E.engine_label(pi.mode, pi.method, pi.compression, pi.encrypt,
                                        E.plan_engine(pi) == "container" and pi.mode == "i2d")}
         try:
-            j = self._plan(plan)
-            out.update(valid=True, message=E.plan_summary(j))
+            jobs = self._plan(plan)
+            out.update(valid=True, message=E.batch_summary(jobs), count=len(jobs))
         except ValueError as e:
             out.update(valid=False, message=str(e))
         return out
 
     def cmd_prepare(self, plan: dict) -> dict:
-        j = self._plan(plan)
+        jobs = self._plan(plan)
         with self.lock:
             v = {d.path: self.usage_cache.get((d.path, d.size, d.fstype, d.uuid, tuple(d.mounts)))
                  for d in self.devs.values()}
-        warnings = E.prepare_job(j, lambda node: (v.get(node) or (None,))[0])
+        warnings = []
+        for j in jobs:
+            warnings += E.prepare_job(j, lambda node: (v.get(node) or (None,))[0])
         token = os.urandom(8).hex()
         with self.lock:
-            self.jobs = {token: j}               # only the latest prepared job can be started
-        return {"token": token, "warnings": warnings, "resume": E.resume_question(j),
-                "passphrase": E.passphrase_kind(j), "browse": j.engine == "browse"}
+            self.jobs = {token: jobs}            # only the latest prepared job(s) can be started
+        j = jobs[0]
+        return {"token": token, "warnings": warnings,
+                "resume": E.resume_question(j) if len(jobs) == 1 else None,
+                "passphrase": E.passphrase_kind(j), "browse": j.engine == "browse", "count": len(jobs)}
 
-    def _job(self, token: str) -> E.Job:
+    def _jobs(self, token: str) -> list[E.Job]:
         with self.lock:
             j = self.jobs.get(token)
         if j is None:
             raise ValueError("This job is no longer prepared. Press Start again.")
         return j
+
+    def _job(self, token: str) -> E.Job:
+        return self._jobs(token)[0]
 
     def cmd_check_passphrase(self, token: str, passphrase: str) -> bool:
         j = self._job(token)
@@ -321,20 +331,23 @@ class Helper:
         return True
 
     def cmd_confirm_info(self, token: str, resume: str | None = None, passphrase: str | None = None) -> dict:
-        j = self._job(token)
+        jobs = self._jobs(token)
         if resume not in (None, "resume", "fresh"):
             raise ValueError("bad resume choice")
-        E.apply_resume_choice(j, resume)
-        kind = E.passphrase_kind(j)
+        for j in jobs:
+            E.apply_resume_choice(j, resume if len(jobs) == 1 else None)
+        kind = E.passphrase_kind(jobs[0])
         if kind:
             if not passphrase:
                 raise ValueError("A passphrase is needed.")
             if kind == "new" and len(passphrase) < 8:
                 raise ValueError("The passphrase needs at least 8 characters.")
-            if kind == "existing" and not E.check_passphrase(j, passphrase):
+            if kind == "existing" and not E.check_passphrase(jobs[0], passphrase):
                 raise ValueError("Wrong passphrase.")
-            j.passphrase = passphrase
-        return {"lines": E.confirm_lines(j), "token_text": E.confirm_token(j),
+            for j in jobs:
+                j.passphrase = passphrase
+        j = jobs[0]
+        return {"lines": E.confirm_lines_for(jobs), "token_text": E.confirm_token(j) if len(jobs) == 1 else "",
                 "danger": j.dst_is_dev}
 
     # ------------------------------------------------------------ jobs
@@ -344,20 +357,18 @@ class Helper:
                                             (self.runner_started and self.job_thread
                                              and self.job_thread.is_alive())):
                 raise ValueError("Another job is running.")
-            j = self.jobs.pop(token, None)
-            if j is None:
+            jobs = self.jobs.pop(token, None)
+            if jobs is None:
                 raise ValueError("This job is no longer prepared. Press Start again.")
-            if j.dst_is_dev and confirm_text.strip() != E.confirm_token(j):
+            j = jobs[0]
+            if len(jobs) == 1 and j.dst_is_dev and confirm_text.strip() != E.confirm_token(j):
                 raise ValueError("The confirmation text does not match the target device.")
             if j.engine == "browse" and self.browse is not None:
                 raise ValueError("Another backup is open. Close it first.")
-            runner = E.JobRunner(j, HelperSink(self.ch))
+            runner = E.make_runner(jobs, HelperSink(self.ch))
             self.runner = runner
             self.runner_started = False
-        return {"info": runner.info_lines(), "steps": [[k, runner.step_names[k], runner.steps[k]]
-                                                        for k in runner.step_names],
-                "items_table": runner.has_items_table(), "engine": j.engine, "mode": j.mode,
-                "logpath": str(runner.logpath)}
+        return runner.start_info()
 
     def cmd_run(self) -> bool:
         """Begin the job created by 'start'. Separate from 'start' so that no job event can reach
@@ -538,7 +549,7 @@ class Helper:
         j = E.fileset_job(self._set(sid), "run" if action == "run" else "check", read_all)
         token = os.urandom(8).hex()
         with self.lock:
-            self.jobs = {token: j}
+            self.jobs = {token: [j]}
         return {"token": token}
 
     # ------------------------------------------------------------ shutdown

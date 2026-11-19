@@ -56,7 +56,7 @@ async def main() -> int:
         await pilot.pause(1.2)
         print("passphrase check off the UI thread:", responsive, "| accepted:", res.get("v"))
         if len(sys.argv) > 1:                      # optional: a .dimg backup to check
-            job = T.plan_job(T.PlanInput(mode="chk", src_path=sys.argv[1]), {})
+            job = T.plan_jobs(T.PlanInput(mode="chk", src_path=sys.argv[1]), {})
             app.push_screen(T.RunScreen(job))
             for _ in range(120):
                 await pilot.pause(0.5)

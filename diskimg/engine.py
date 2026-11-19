@@ -3083,6 +3083,9 @@ class JobSink:
     def button(self, name: str, enabled: bool) -> None:   # "skip" | "stop"
         pass
 
+    def begin(self, info: dict) -> None:   # next job of a batch starts (see JobRunner.start_info)
+        pass
+
 
 class JobRunner:
     """Runs one job (backup, restore, clone, check, browse, file backup). User-interface free:
@@ -3140,6 +3143,12 @@ class JobRunner:
 
     def has_items_table(self) -> bool:
         return self.job.engine in ("container", "check", "browse")
+
+    def start_info(self) -> dict:
+        """What a user interface needs to show the progress page of this job."""
+        return {"info": self.info_lines(), "steps": [[k, self.step_names[k], self.steps[k]] for k in self.step_names],
+                "items_table": self.has_items_table(), "engine": self.job.engine, "mode": self.job.mode,
+                "logpath": str(self.logpath)}
 
     def stop_text(self) -> str | None:
         """Text for the 'Stop?' question, or None when there is nothing to stop right now."""
@@ -5054,6 +5063,128 @@ class JobRunner:
 
 
 
+class BatchRunner:
+    """Runs several jobs one after the other (several sources backed up at once). Offers the same
+    interface as JobRunner, delegating to the job that is currently running."""
+
+    def __init__(self, jobs: list[Job], sink: JobSink | None = None):
+        self.sink = sink or JobSink()
+        self.runners = [JobRunner(j, self.sink) for j in jobs]
+        self.idx = 0
+        self.running = False
+        self.stop_all = False
+        self.quit_after = False
+        self.result: tuple[str, str] | None = None
+        self.browse_session = None
+
+    @property
+    def cur(self) -> JobRunner:
+        return self.runners[self.idx]
+
+    @property
+    def job(self) -> Job:
+        return self.cur.job
+
+    @property
+    def steps(self):
+        return self.cur.steps
+
+    @property
+    def step_names(self):
+        return self.cur.step_names
+
+    @property
+    def logpath(self):
+        return self.cur.logpath
+
+    def info_lines(self) -> list[str]:
+        return [f"[b]Backup {self.idx + 1} of {len(self.runners)}[/b]"] + self.cur.info_lines()
+
+    def has_items_table(self) -> bool:
+        return self.cur.has_items_table()
+
+    def start_info(self) -> dict:
+        return {**self.cur.start_info(), "info": self.info_lines()}
+
+    def stop_text(self) -> str | None:
+        t = self.cur.stop_text()
+        rest = len(self.runners) - self.idx - 1
+        if t and rest:
+            t += f" The remaining {rest} backup(s) are not started."
+        return t
+
+    def request_stop(self) -> None:
+        self.stop_all = True
+        self.cur.request_stop()
+
+    def request_quit(self) -> None:
+        self.quit_after = True
+        self.stop_all = True
+        self.cur.request_quit()
+
+    def request_skip(self) -> bool:
+        return self.cur.request_skip()
+
+    def run(self) -> tuple[str, str]:
+        self.running = True
+        results: list[tuple[str, str]] = []
+        for i, r in enumerate(self.runners):
+            if self.stop_all:
+                results.append(("NOT STARTED", "$warning"))
+                continue
+            self.idx = i
+            if i:
+                self.sink.begin(self.start_info())
+            r.log(f"[b]Backup {i + 1} of {len(self.runners)}: {escape(r.job.src_label)}[/b]")
+            results.append(r.run())
+        n = len(results)
+        ok = sum(1 for _, st in results if st == "$success")
+        self.sink.log("[b]Summary[/b]")
+        for r, (res, st) in zip(self.runners, results):
+            self.sink.log(f"[{st}]{escape(r.job.src)}: {escape(res)}[/]")
+        if ok == n:
+            self.result = (f"SUCCESS - all {n} backups written and verified", "$success")
+        elif any(st == "$error" for _, st in results):
+            self.result = (f"{n - ok} of {n} backups FAILED or incomplete - see the summary", "$error")
+        else:
+            self.result = (f"{ok} of {n} backups fully OK, others with warnings - see the summary", "$warning")
+        self.running = False
+        return self.result
+
+
+def make_runner(jobs: list[Job], sink: JobSink | None = None):
+    return JobRunner(jobs[0], sink) if len(jobs) == 1 else BatchRunner(jobs, sink)
+
+
+# ----------------------------------------------------------------------------
+#  Mounting drives (udisks, so that file managers see the same mounts)
+# ----------------------------------------------------------------------------
+def mounted_nodes(dev: Dev) -> list[str]:
+    """Device nodes in dev's subtree that are mounted, deepest first."""
+    nodes = [x for x in dev.subtree() if x.mounts]
+    return [x.path for x in sorted(nodes, key=lambda x: -x.depth)]
+
+
+def mount_cmd(node: str, readonly: bool) -> list[str]:
+    return ["udisksctl", "mount", "-b", node] + (["-o", "ro"] if readonly else [])
+
+
+def unmount_cmd(node: str) -> list[str]:
+    return ["udisksctl", "unmount", "-b", node]
+
+
+def device_properties(d: Dev) -> list[tuple[str, str]]:
+    rows = [("Device", d.path), ("Size", f"{human(d.size)} ({d.size:,} bytes)"), ("Type", d.kind),
+            ("Label", d.label or "-"), ("Filesystem", d.fstype or "-"), ("UUID", d.uuid or "-")]
+    disk = d if d.kind == "disk" else next((a for a in d.ancestors() if a.kind == "disk"), None)
+    if disk is not None:
+        rows += [("Disk", disk.path), ("Model", disk.model or "-"), ("Serial number", disk.serial or "-"),
+                 ("Partition table", (disk.pttype or "-").upper()), ("Connection", disk.tran or "-")]
+    mounts = [m for x in d.subtree() for m in x.mounts]
+    rows += [("Mounted at", ", ".join(mounts) or "not mounted"), ("Status", d.busy or ("read-only" if d.ro else "ok"))]
+    return rows
+
+
 # ----------------------------------------------------------------------------
 #  Planning (shared by the text UI and the GTK helper)
 # ----------------------------------------------------------------------------
@@ -5075,6 +5206,7 @@ class PlanInput:
     retries: int = 1
     keep_cache: bool = False
     src_dev: str = ""              # device path (d2i, d2d)
+    src_devs: list[str] = field(default_factory=list)   # several sources (d2i): one backup each
     dst_dev: str = ""              # device path (d2d, i2d)
     src_path: str = ""             # backup file/folder (i2d, chk, brw)
     dst_path: str = ""             # backup to create (d2i)
@@ -5088,6 +5220,9 @@ class PlanInput:
         pi.compression = int(pi.compression or 0)
         pi.retries = int(pi.retries or 0)
         pi.browse_ids = [str(x) for x in (pi.browse_ids or [])]
+        pi.src_devs = [str(x) for x in (pi.src_devs or []) if x]
+        if len(pi.src_devs) == 1 and not pi.src_dev:
+            pi.src_dev = pi.src_devs[0]
         return pi
 
 
@@ -5333,6 +5468,53 @@ def plan_job(pi: PlanInput, devs: dict[str, Dev]) -> Job:
     )
 
 
+def is_batch(pi: PlanInput) -> bool:
+    return pi.mode == "d2i" and len(pi.src_devs) > 1
+
+
+def plan_jobs(pi: PlanInput, devs: dict[str, Dev]) -> list[Job]:
+    """Like plan_job, but with several sources (Disk -> Image) one backup per source: the
+    destination is then a folder and every backup gets its default name in it."""
+    if not is_batch(pi):
+        return [plan_job(pi, devs)]
+    srcs = pi.src_devs
+    for a in srcs:
+        if a not in devs:
+            raise ValueError(f"{a} is no longer connected.")
+    for i, a in enumerate(srcs):
+        for b in srcs[i + 1:]:
+            if devs_overlap(devs[a], devs[b]):
+                raise ValueError(f"{a} and {b} overlap (a disk and one of its partitions). Select only one of them.")
+    folder = Path(pi.dst_path.strip() or "/").expanduser()
+    for ext in (".img", CONTAINER_EXT):
+        if folder.name.endswith(ext) and not folder.is_dir():
+            folder = folder.parent
+    if not folder.is_absolute() or not folder.is_dir():
+        raise ValueError(f"Choose an existing folder for the {len(srcs)} backups.")
+    jobs, names = [], set()
+    for d in srcs:
+        name = default_backup_name(devs[d], wanted_ext(pi))
+        while name in names:
+            stem, dot, ext = name.rpartition(".")
+            name = f"{stem}_2.{ext}"
+        names.add(name)
+        sub = PlanInput(**{**asdict(pi), "src_dev": d, "src_devs": [], "dst_path": str(folder / name)})
+        try:
+            jobs.append(plan_job(sub, devs))
+        except ValueError as e:
+            raise ValueError(f"{d}: {e}")
+    return jobs
+
+
+def batch_summary(jobs: list[Job]) -> str:
+    if len(jobs) == 1:
+        return plan_summary(jobs[0])
+    folder = Path(jobs[0].dst).parent
+    names = ", ".join(Path(j.src).name for j in jobs)
+    return (f"[b $success]Ready[/]  {len(jobs)} backups ({escape(names)}) [dim]->[/] {escape(str(folder))}  "
+            f"[dim]one after the other[/]")
+
+
 def plan_summary(j: Job) -> str:
     """One line (markup) describing a valid job."""
     if j.mode == "chk":
@@ -5436,6 +5618,26 @@ def check_passphrase(job: Job, pw: str) -> bool:
 def confirm_token(job: Job) -> str:
     """What the user must type before a device is overwritten ('' = no typing needed)."""
     return Path(job.dst).name if job.dst_is_dev else ""
+
+
+def confirm_lines_for(jobs: list[Job]) -> list[str]:
+    if len(jobs) == 1:
+        return confirm_lines(jobs[0])
+    j = jobs[0]
+    lines = [f"[b]{len(jobs)} backups, one after the other[/b]",
+             f"[b]Engine[/b]   {escape(engine_label(j.mode, j.method, j.compression, j.encrypt, False))}"]
+    if j.engine == "container":
+        lines.append(f"[b]Options[/b]  compression: {'zstd -' + str(j.compression) if j.compression else 'off'}"
+                     f"   encryption: {'AES-256 (gpg)' if j.encrypt else 'off'}")
+    lines.append("")
+    for n, x in enumerate(jobs, 1):
+        lines.append(f"{n}. {escape(x.src_label)}")
+        lines.append(f"   [dim]->[/] {escape(x.dst)}")
+        if x.layout and x.method == "fs":
+            for w in x.layout.warnings:
+                lines.append(f"   [$warning]! {escape(w)}[/]")
+    lines += ["", "[dim]If one backup fails, the others still run. The result lists each one.[/]"]
+    return lines
 
 
 def confirm_lines(job: Job) -> list[str]:

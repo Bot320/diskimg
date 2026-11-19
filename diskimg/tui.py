@@ -39,6 +39,7 @@ from textual.widgets import (
 )
 
 from .engine import (  # noqa: E501
+    run,
     BORDER,
     BROWSE_CACHE,
     BROWSE_ROOT,
@@ -49,7 +50,6 @@ from .engine import (  # noqa: E501
     DEFAULT_EXCLUDES,
     Dev,
     Job,
-    JobRunner,
     JobSink,
     KEEP_POLICIES,
     LOG_DIR,
@@ -62,13 +62,14 @@ from .engine import (  # noqa: E501
     STATE_DIR,
     VERSION,
     apply_resume_choice,
+    batch_summary,
     block_usage,
     browse_candidates,
     cancel_usage,
     check_passphrase,
     chown_tree,
     close_browse,
-    confirm_lines,
+    confirm_lines_for,
     confirm_token,
     conn_key,
     conn_source,
@@ -77,6 +78,7 @@ from .engine import (  # noqa: E501
     default_backup_name,
     default_cache_dir,
     desktop_user,
+    device_properties,
     devs_overlap,
     engine_label,
     existing_ancestor,
@@ -93,8 +95,11 @@ from .engine import (  # noqa: E501
     load_devices,
     load_filesets,
     load_shares,
+    make_runner,
     map_totals,
+    mount_cmd,
     mount_share,
+    mounted_nodes,
     net_mounts,
     ntfs_partitions,
     open_in_file_manager,
@@ -103,8 +108,7 @@ from .engine import (  # noqa: E501
     passphrase_kind,
     places_options,
     plan_engine,
-    plan_job,
-    plan_summary,
+    plan_jobs,
     prepare_job,
     read_manifest,
     resume_question,
@@ -118,6 +122,7 @@ from .engine import (  # noqa: E501
     tree_size,
     umount_path,
     unique_dest,
+    unmount_cmd,
     usage_allowed,
     usage_generation,
     validate_fileset,
@@ -278,12 +283,14 @@ class ConfirmModal(ModalScreen[bool]):
 
     def __init__(self, job: Job):
         super().__init__()
-        self.job = job
-        self.token = confirm_token(job)
+        jobs = job if isinstance(job, list) else [job]
+        self.job = jobs[0]
+        self.jobs = jobs
+        self.token = confirm_token(self.job) if len(jobs) == 1 else ""
 
     def compose(self) -> ComposeResult:
         j = self.job
-        lines = confirm_lines(j)
+        lines = confirm_lines_for(self.jobs)
         with Vertical(classes="dialog wide"):
             yield Label("Confirm job", classes="dlg-title")
             with VerticalScroll(classes="dlg-scroll"):
@@ -1110,6 +1117,10 @@ class MainScreen(Screen):
         Binding("6", "mode('fbk')", "Files"),
         Binding("n", "network", "NAS"),
         Binding("r", "refresh", "Refresh"),
+        Binding("u", "unmount", "Unmount"),
+        Binding("o", "mount_ro", "Mount ro", show=False),
+        Binding("w", "mount_rw", "Mount rw", show=False),
+        Binding("i", "properties", "Properties", show=False),
         Binding("s", "start", "Start"),
         Binding("q", "quit_app", "Quit"),
     ]
@@ -1118,7 +1129,7 @@ class MainScreen(Screen):
         super().__init__()
         self.mode = "d2i"
         self.devs: dict[str, Dev] = {}
-        self.src_sel: str | None = None
+        self.src_sels: list[str] = []          # Disk -> Image: several sources allowed
         self.dst_sel: str | None = None
         self.dev_sig = ""
         self.default_name = ""
@@ -1202,7 +1213,7 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         for tid in ("#src-table", "#dst-table"):
             t = self.query_one(tid, DevTable)
-            for col in (" ", "Device", "Size", "Type", "Model / Label", "FS", "Used", "Bus", "Status"):
+            for col in (" ", "Device", "Size", "Type", "Label", "Model", "FS", "Used", "Bus", "Status"):
                 t.add_column(col, key=col)
         bt = self.query_one("#brw-table", DataTable)
         for col, w in ((" ", 3), ("Item", 8), ("FS", 14), ("Label", 14), ("Size", 10),
@@ -1213,6 +1224,10 @@ class MainScreen(Screen):
         self.load_devs()
         self.set_mode("d2i")
         self.set_interval(3, self.poll_devices)
+
+    @property
+    def src_sel(self) -> str | None:
+        return self.src_sels[0] if self.src_sels else None
 
     # ---- device handling ----
     def load_devs(self, devs: dict | None = None, light_sig: str | None = None) -> None:
@@ -1226,8 +1241,7 @@ class MainScreen(Screen):
         self.dev_sig = self._sig(self.devs)
         if light_sig is not None:
             self.dev_sig_light = light_sig
-        if self.src_sel not in self.devs:
-            self.src_sel = None
+        self.src_sels = [p for p in self.src_sels if p in self.devs]
         if self.dst_sel not in self.devs:
             self.dst_sel = None
         self.fill_tables()
@@ -1271,7 +1285,7 @@ class MainScreen(Screen):
             self._polling = False
 
     def fill_tables(self) -> None:
-        for tid, sel in (("#src-table", self.src_sel), ("#dst-table", self.dst_sel)):
+        for tid, sel in (("#src-table", self.src_sels), ("#dst-table", [self.dst_sel] if self.dst_sel else [])):
             t = self.query_one(tid, DevTable)
             cursor_key = None
             try:
@@ -1285,19 +1299,20 @@ class MainScreen(Screen):
                     continue
                 name = ("  " * d.depth + ("`-" if CONSOLE else "└ ") if d.depth else "") + d.name
                 if d.busy:
-                    status = Text("in use", style="bold red")
+                    status = Text("mounted" if d.busy.startswith("mounted") else "in use", style="bold red")
                 elif d.ro:
                     status = Text("read-only", style="yellow")
                 else:
                     status = Text("ok", style="green")
-                other = self.dst_sel if tid == "#src-table" else self.src_sel
-                if other and other in self.devs and self.overlaps(self.devs[other], d):
+                others = ([self.dst_sel] if self.dst_sel else []) if tid == "#src-table" else self.src_sels
+                if any(o in self.devs and self.overlaps(self.devs[o], d) for o in others):
                     status = Text("selected " + ("target" if tid == "#src-table" else "source"),
                                   style="magenta")
                 t.add_row(
-                    Text(SEL, style="bold green") if d.path == sel else " ",
-                    Text(name, style="bold" if d.path == sel else ""),
-                    human(d.size), d.kind, d.desc, d.fstype or (d.pttype and f"[{d.pttype}]") or "-",
+                    Text(SEL, style="bold green") if d.path in sel else " ",
+                    Text(name, style="bold" if d.path in sel else ""),
+                    human(d.size), d.kind, Text(d.label or "-", style="bold" if d.label else "dim"),
+                    d.model or "-", d.fstype or (d.pttype and f"[{d.pttype}]") or "-",
                     self.used_text(d),
                     (d.tran or ("usb/rm" if d.rm else "-")), status,
                     key=d.path,
@@ -1360,6 +1375,63 @@ class MainScreen(Screen):
             self.app.usage[key] = v
             self.app.call_from_thread(self.fill_tables)
 
+    # ---- mount / unmount / properties (keys u, o, w, i on the highlighted device) ----
+    def cursor_dev(self) -> Dev | None:
+        for tid in ("#src-table", "#dst-table"):
+            t = self.query_one(tid, DevTable)
+            if t.display and t.has_focus and t.row_count:
+                try:
+                    return self.devs.get(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+                except Exception:  # noqa: BLE001
+                    return None
+        self.app.notify("Move the cursor to a device in a list first.", severity="warning")
+        return None
+
+    def action_unmount(self) -> None:
+        d = self.cursor_dev()
+        if d:
+            self.mount_worker(d, "unmount")
+
+    def action_mount_ro(self) -> None:
+        d = self.cursor_dev()
+        if d:
+            self.mount_worker(d, "ro")
+
+    def action_mount_rw(self) -> None:
+        d = self.cursor_dev()
+        if d:
+            self.mount_worker(d, "rw")
+
+    def action_properties(self) -> None:
+        d = self.cursor_dev()
+        if d:
+            self.app.push_screen(MessageModal(f"Properties of {d.path}", "\n".join(
+                f"[b]{k:<16}[/b]{escape(v)}" for k, v in device_properties(d))))
+
+    @work(thread=True, exclusive=True, group="mount")
+    def mount_worker(self, d: Dev, what: str) -> None:
+        if not shutil.which("udisksctl"):
+            self.app.call_from_thread(self.app.notify, "udisks is not installed (pacman -S udisks2).",
+                                      severity="error")
+            return
+        cmds = ([unmount_cmd(n) for n in mounted_nodes(d)] if what == "unmount"
+                else [mount_cmd(d.path, what == "ro")])
+        if not cmds:
+            self.app.call_from_thread(self.app.notify, f"{d.path} is not mounted.")
+            return
+        for c in cmds:
+            r = run(c, timeout=120)
+            if r.returncode != 0:
+                msg = ((r.stderr or r.stdout).strip().splitlines() or ["failed"])[-1]
+                self.app.call_from_thread(self.app.notify, f"{c[-1] if what == 'unmount' else d.path}: {msg}",
+                                          severity="error", timeout=10)
+                break
+        else:
+            self.app.call_from_thread(self.app.notify, f"{d.path}: " + {"unmount": "unmounted",
+                                      "ro": "mounted read-only", "rw": "mounted read/write"}[what])
+        self.app.call_from_thread(self.load_devs)
+        self.app.call_from_thread(self.update_summary)
+
     @staticmethod
     def overlaps(a: Dev, b: Dev) -> bool:
         return devs_overlap(a, b)
@@ -1386,6 +1458,7 @@ class MainScreen(Screen):
             retries=int(self.opt("#opt-retry") or 0),
             keep_cache=bool(self.opt("#opt-keep")),
             src_dev=self.src_sel or "",
+            src_devs=list(self.src_sels) if self.mode == "d2i" else self.src_sels[:1],
             dst_dev=self.dst_sel or "",
             src_path=self.query_one("#src-path", Input).value,
             dst_path=self.query_one("#dst-path", Input).value,
@@ -1581,11 +1654,19 @@ class MainScreen(Screen):
         if not d:
             return
         is_src = ev.data_table.id == "src-table"
-        if d.busy:
-            self.app.notify(f"{d.path} is {d.busy}. Unmount it first.", severity="warning")
+        # selecting again unselects; Disk -> Image takes several sources (one backup each)
+        if is_src and path in self.src_sels:
+            self.src_sels.remove(path)
+        elif not is_src and path == self.dst_sel:
+            self.dst_sel = None
+        elif d.busy:
+            self.app.notify(f"{d.path} is {d.busy}. Unmount it first (key u).", severity="warning")
             return
-        if is_src:
-            self.src_sel = path
+        elif is_src:
+            if self.mode == "d2i":
+                self.src_sels = [p for p in self.src_sels if not self.overlaps(self.devs[p], d)] + [path]
+            else:
+                self.src_sels = [path]
             if self.dst_sel and self.overlaps(d, self.devs[self.dst_sel]):
                 self.dst_sel = None
         else:
@@ -1593,8 +1674,7 @@ class MainScreen(Screen):
                 self.app.notify(f"{d.path} is read-only.", severity="warning")
                 return
             self.dst_sel = path
-            if self.src_sel and self.overlaps(d, self.devs[self.src_sel]):
-                self.src_sel = None
+            self.src_sels = [p for p in self.src_sels if not self.overlaps(d, self.devs[p])]
         self.fill_tables()
         self.update_default_name()
         self.update_summary()
@@ -1609,7 +1689,14 @@ class MainScreen(Screen):
         new_name = default_backup_name(self.devs.get(self.src_sel or ""), ext)
         inp = self.query_one("#dst-path", Input)
         cur = inp.value.strip()
-        if not cur:
+        if len(self.src_sels) > 1:           # several sources: the field holds the folder
+            if cur.endswith((".img", CONTAINER_EXT)):
+                inp.value = str(Path(cur).parent)
+            self.default_name = ""
+            return
+        if cur and Path(cur).is_dir() and not cur.endswith((".img", CONTAINER_EXT)):
+            inp.value = str(Path(cur) / new_name)
+        elif not cur:
             inp.value = str(Path("/mnt") / new_name) if Path("/mnt").is_dir() else "/" + new_name
         elif self.default_name and Path(cur).name == self.default_name:
             inp.value = str(Path(cur).parent / new_name)
@@ -1679,10 +1766,10 @@ class MainScreen(Screen):
         self.update_summary()
 
     # ---- planning / validation ----
-    def plan(self) -> Job:
+    def plan(self) -> list[Job]:
         if self.mode == "brw" and self.brw_src != self.query_one("#src-path", Input).value.strip():
             self.fill_brw()
-        return plan_job(self.plan_input(), self.devs)
+        return plan_jobs(self.plan_input(), self.devs)
 
     def update_info_lines(self) -> None:
         info = self.query_one("#dst-info", Static)
@@ -1749,7 +1836,7 @@ class MainScreen(Screen):
             s.update(f"[b $warning]{escape(str(e))}[/]")
             b.disabled = True
             return
-        s.update(plan_summary(j))
+        s.update(batch_summary(j))
         b.disabled = False
 
     # ---- start flow ----
@@ -1774,10 +1861,11 @@ class MainScreen(Screen):
             self.jump_to(mp)
             self.update_summary()
         try:
-            job = self.plan()
+            jobs = self.plan()
         except ValueError as e:
             self.app.notify(str(e), severity="error")
             return
+        job = jobs[0]
 
         # analyse source / image layout (reads partition tables: not on the UI thread)
         if job.engine == "container" and job.mode in ("d2i", "d2d"):
@@ -1789,14 +1877,15 @@ class MainScreen(Screen):
             v = self.app.usage.get(self.usage_key(d)) if d else None
             return v[0] if v else None
         try:
-            for w in await trio_free_to_thread(prepare_job, job, used):
-                self.app.notify(w, severity="warning", timeout=8)
+            for j in jobs:
+                for w in await trio_free_to_thread(prepare_job, j, used):
+                    self.app.notify(w, severity="warning", timeout=8)
         except ValueError as e:
             self.app.notify(str(e), severity="error", timeout=10)
             return
 
-        # resume detection (ddrescue)
-        body = resume_question(job)
+        # resume detection (ddrescue; a batch always starts new backups)
+        body = resume_question(job) if len(jobs) == 1 else None
         choice = None
         if body:
             choice = await self.app.push_screen_wait(ChoiceModal(
@@ -1804,7 +1893,8 @@ class MainScreen(Screen):
                 [("resume", "Resume", "success"), ("fresh", "Start over", "warning")]))
             if choice is None:
                 return
-        apply_resume_choice(job, choice)
+        for j in jobs:
+            apply_resume_choice(j, choice)
 
         # passphrase
         kind = passphrase_kind(job)
@@ -1812,7 +1902,8 @@ class MainScreen(Screen):
             pw = await self.app.push_screen_wait(PassphraseModal(new=True))
             if pw is None:
                 return
-            job.passphrase = pw
+            for j in jobs:
+                j.passphrase = pw
         elif kind == "existing":
             pw = await self.app.push_screen_wait(
                 PassphraseModal(new=False, checker=lambda x: check_passphrase(job, x)))
@@ -1821,11 +1912,11 @@ class MainScreen(Screen):
             job.passphrase = pw
 
         if job.engine == "browse":
-            self.app.push_screen(RunScreen(job))
+            self.app.push_screen(RunScreen(jobs))
             return
-        ok = await self.app.push_screen_wait(ConfirmModal(job))
+        ok = await self.app.push_screen_wait(ConfirmModal(jobs))
         if ok:
-            self.app.push_screen(RunScreen(job))
+            self.app.push_screen(RunScreen(jobs))
 
     @on(Button.Pressed, "#btn-start")
     def start_btn(self) -> None:
@@ -1889,6 +1980,9 @@ class TuiSink(JobSink):
     def button(self, name: str, enabled: bool) -> None:
         self._call(self.scr._set_btn, f"#btn-{name}", not enabled)
 
+    def begin(self, info: dict) -> None:
+        self._call(self.scr.next_job)
+
 
 class RunScreen(Screen):
     BINDINGS = [
@@ -1898,10 +1992,11 @@ class RunScreen(Screen):
         Binding("escape", "back", "Back", show=False),
     ]
 
-    def __init__(self, job: Job):
+    def __init__(self, job):
         super().__init__()
-        self.job = job
-        self.runner = JobRunner(job, TuiSink(self))
+        jobs = job if isinstance(job, list) else [job]
+        self.job = jobs[0]
+        self.runner = make_runner(jobs, TuiSink(self))
         self.running = True
         self.quit_after = False
         self.items_rows: set[str] = set()
@@ -1975,6 +2070,15 @@ class RunScreen(Screen):
 
     def log_line(self, msg: str) -> None:
         self.query_one("#log", RichLog).write(self.themed(msg))
+
+    def next_job(self) -> None:
+        """The next backup of a batch starts: new job info, steps and items."""
+        self.job = self.runner.job
+        self.query_one("#jobinfo", Static).update(self.themed("\n".join(self.runner.info_lines())))
+        self.render_steps()
+        t = self.query_one("#items", DataTable)
+        t.clear()
+        self.items_rows = set()
 
     def render_steps(self) -> None:
         out = []

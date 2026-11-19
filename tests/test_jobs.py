@@ -167,6 +167,30 @@ def main() -> int:
           f"unverified replacement keeps the previous backup as .old ({res})")
     check(E.is_container(dst), "new backup in place")
 
+    # --- several sources at once (batch): one backup each into a folder
+    src2 = work / "src2.ext4"
+    make_ext4(src2, 32, content)
+    bdevs = {str(src): fake_dev(src, "ext4"), str(src2): fake_dev(src2, "ext4")}
+    folder = work / "batch"
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir()
+    bpi = E.PlanInput(mode="d2i", method="fs", src_devs=[str(src), str(src2)], dst_path=str(folder))
+    jobs = E.plan_jobs(bpi, bdevs)
+    check(len(jobs) == 2 and len({j.dst for j in jobs}) == 2, f"batch planned: {[Path(j.dst).name for j in jobs]}")
+    for j in jobs:
+        E.prepare_job(j)
+        E.apply_resume_choice(j, None)
+    sink = Sink()
+    br = E.BatchRunner(jobs, sink)
+    res, style = br.run()
+    check(style == "$success" and "all 2" in res, f"batch run -> {res}")
+    check(all(E.is_container(Path(j.dst)) for j in jobs), "both backups written")
+    try:
+        E.plan_jobs(E.PlanInput(mode="d2i", src_devs=[str(src), str(src2)], dst_path=str(work / "nope")), bdevs)
+        check(False, "batch without existing folder must be refused")
+    except ValueError as e:
+        check(True, f"batch needs an existing folder ({e})")
+
     # --- raw image via ddrescue: backup + check, restore with a .map that records bad areas ---
     img = work / "raw.img"
     for f in (img, Path(str(img) + ".map"), Path(str(img) + ".sha256")):

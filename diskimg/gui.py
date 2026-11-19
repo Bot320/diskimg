@@ -16,7 +16,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from rich.markup import escape as rich_escape  # noqa: E402
 from rich.text import Text  # noqa: E402
@@ -277,39 +277,47 @@ def clear_box(box) -> None:
 
 
 class DeviceList(Gtk.Box):
-    """Block devices as a selectable table."""
+    """Block devices as a table. Click selects (click again to unselect); right click opens a menu
+    with Unmount / Mount read-only / Mount read/write / Properties."""
     # (title, minimum width in characters, expands): narrow minimums so that the window also fits
     # small screens (e.g. 1024 px on the rescue USB); long texts are shortened with "…"
-    COLS = (("Device", 11, False), ("Size", 8, False), ("Type", 4, False), ("Model / Label", 8, True),
-            ("FS", 6, False), ("Used", 9, False), ("Bus", 5, False), ("Status", 8, False))
+    COLS = (("Device", 11, False), ("Size", 8, False), ("Type", 4, False), ("Label", 8, True),
+            ("Model", 6, True), ("FS", 6, False), ("Used", 9, False), ("Bus", 5, False), ("Status", 8, False))
+    USED = 6
 
-    def __init__(self, on_select):
+    def __init__(self, on_select, on_menu):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.on_select = on_select
+        self.on_menu = on_menu
         self.groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in self.COLS]
-        head = self._row_box([f"<b>{c[0]}</b>" for c in self.COLS], markup=True)
+        head, _ = self._row_box([f"<b>{c[0]}</b>" for c in self.COLS], markup=True)
         head.add_css_class("dim-label")
         head.set_margin_start(30)
         self.append(head)
         self.lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.lb.add_css_class("boxed-list")
         self.lb.connect("row-activated", self._activated)
+        rc = Gtk.GestureClick(button=3)
+        rc.connect("pressed", self._right_click)
+        self.lb.add_controller(rc)
         sw = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
         sw.set_child(self.lb)
         self.append(sw)
         self.used_labels: dict[str, Gtk.Label] = {}
 
-    def _row_box(self, cells, markup=False) -> Gtk.Box:
+    def _row_box(self, cells, markup=False):
         box = Gtk.Box(spacing=8, margin_top=4, margin_bottom=4, margin_end=8)
+        labels = []
         for (name, width, expand), g, txt in zip(self.COLS, self.groups, cells):
             lb = label(txt, markup=markup, ellipsize=True, hexpand=expand)
             lb.set_width_chars(width)
-            lb.set_max_width_chars(40 if expand else width + 6)
+            lb.set_max_width_chars(30 if expand else width + 6)
             g.add_widget(lb)
             box.append(lb)
-        return box
+            labels.append(lb)
+        return box, labels
 
-    def set_devices(self, devs: list[dict], selected: str | None, other: str | None,
+    def set_devices(self, devs: list[dict], selected: list[str], other: list[str],
                     usage: dict[str, str]) -> None:
         self.lb.remove_all()
         self.used_labels = {}
@@ -331,35 +339,39 @@ class DeviceList(Gtk.Box):
             if not d["selectable"]:
                 continue
             if d["busy"]:
-                status = f'<span foreground="{COLORS["error"]}">in use</span>'
+                status = f'<span foreground="{COLORS["error"]}">' + ("mounted" if d["busy"].startswith("mounted")
+                                                                     else "in use") + "</span>"
             elif d["ro"]:
                 status = f'<span foreground="{COLORS["warning"]}">read-only</span>'
             else:
                 status = f'<span foreground="{COLORS["success"]}">ok</span>'
-            if related(other, d["path"]):
+            if any(related(o, d["path"]) for o in other):
                 status = f'<span foreground="{COLORS["magenta"]}">other side</span>'
             name = ("   " * d["depth"] + ("└ " if d["depth"] else "")) + d["name"]
             fs = d["fstype"] or (f"[{d['pttype']}]" if d["pttype"] else "-")
             cells = [GLib.markup_escape_text(x) for x in
-                     (name, E.human(d["size"]), d["kind"], d["desc"], fs,
+                     (name, E.human(d["size"]), d["kind"], d["label"] or "-", d["model"] or "-", fs,
                       ("-" if d["fstype"] == "swap" or (d["has_children"] and not d["fstype"])
                        else usage.get(d["path"], "?" if not d["mounts"] else "...")),
                       d["tran"] or ("usb/rm" if d["rm"] else "-"))] + [status]
-            box = self._row_box(cells, markup=True)
-            self.used_labels[d["path"]] = box.get_first_child().get_next_sibling().get_next_sibling() \
-                .get_next_sibling().get_next_sibling().get_next_sibling()
+            if d["label"]:
+                cells[3] = f"<b>{cells[3]}</b>"
+            box, labels = self._row_box(cells, markup=True)
+            self.used_labels[d["path"]] = labels[self.USED]
+            sel = d["path"] in selected
             check = Gtk.Image.new_from_icon_name("object-select-symbolic")
             check.set_pixel_size(16)
-            check.set_opacity(1.0 if d["path"] == selected else 0.0)
+            check.set_opacity(1.0 if sel else 0.0)
             outer = Gtk.Box(spacing=6, margin_start=6)
             outer.append(check)
             outer.append(box)
             row = Gtk.ListBoxRow(activatable=True)
             row.set_child(outer)
             row.path = d["path"]
-            if d["path"] == selected:
+            if sel:
                 row.add_css_class("accent")
-            row.set_tooltip_text(d["busy"] or d["long"])
+            row.set_tooltip_text((d["busy"] + "\n" if d["busy"] else "") + d["long"]
+                                 + "\nRight click: mount, unmount, properties")
             self.lb.append(row)
 
     def set_usage(self, path: str, text: str) -> None:
@@ -369,6 +381,13 @@ class DeviceList(Gtk.Box):
 
     def _activated(self, _lb, row) -> None:
         self.on_select(row.path)
+
+    def _right_click(self, gesture, _n, x, y) -> None:
+        row = self.lb.get_row_at_y(int(y))
+        if row is None:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.on_menu(row.path, self.lb, x, y)
 
 
 class LogView(Gtk.ScrolledWindow):
@@ -645,7 +664,7 @@ class SetupPage(Gtk.Box):
         self.mode = "d2i"
         self.devs: list[dict] = []
         self.usage: dict[str, str] = {}
-        self.src_sel: str | None = None
+        self.src_sels: list[str] = []            # Disk -> Image: several sources allowed
         self.dst_sel: str | None = None
         self.brw_rows: list[dict] = []
         self.brw_sel: set[str] = set()
@@ -713,7 +732,7 @@ class SetupPage(Gtk.Box):
                        margin_end=14, margin_top=12, margin_bottom=12)
         self.src_title = label("", markup=True, css=("heading",))
         main.append(self.src_title)
-        self.src_devs = DeviceList(lambda p: self.select_dev("src", p))
+        self.src_devs = DeviceList(lambda p: self.select_dev("src", p), self.device_menu)
         main.append(self.src_devs)
         self.src_file = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         row = Gtk.Box(spacing=6)
@@ -733,7 +752,7 @@ class SetupPage(Gtk.Box):
 
         self.dst_title = label("", markup=True, css=("heading",))
         main.append(self.dst_title)
-        self.dst_devs = DeviceList(lambda p: self.select_dev("dst", p))
+        self.dst_devs = DeviceList(lambda p: self.select_dev("dst", p), self.device_menu)
         main.append(self.dst_devs)
         self.dst_file = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         row = Gtk.Box(spacing=6)
@@ -788,7 +807,9 @@ class SetupPage(Gtk.Box):
             "zero_fill": self.zero.get_active(), "fix_gpt": self.gpt.get_active(),
             "idirect": self.direct.get_active(), "retries": self.retry_vals[self.retry.get_selected()],
             "keep_cache": self.keep.get_active(),
-            "src_dev": self.src_sel or "", "dst_dev": self.dst_sel or "",
+            "src_dev": self.src_sels[0] if len(self.src_sels) == 1 else "",
+            "src_devs": list(self.src_sels) if self.mode == "d2i" else self.src_sels[:1],
+            "dst_dev": self.dst_sel or "",
             "src_path": self.src_path.get_text(), "dst_path": self.dst_path.get_text(),
             "browse_ids": sorted(self.brw_sel), "cache_path": self.cache_path.get_text(),
         }
@@ -802,6 +823,9 @@ class SetupPage(Gtk.Box):
             self.modes.select_row(self.mode_rows[self.mode])
             return
         self.mode = mode
+        if mode != "d2i":
+            self.src_sels = self.src_sels[:1]      # only Disk -> Image takes several sources
+        self.fill_devs()
         self.modes.select_row(self.mode_rows[mode])
         src_dev = mode in ("d2i", "d2d")
         dst_dev = mode in ("d2d", "i2d")
@@ -905,22 +929,28 @@ class SetupPage(Gtk.Box):
     def set_devices(self, devs: list[dict]) -> None:
         self.devs = devs
         paths = {d["path"] for d in devs}
-        if self.src_sel not in paths:
-            self.src_sel = None
+        self.src_sels = [p for p in self.src_sels if p in paths]
         if self.dst_sel not in paths:
             self.dst_sel = None
+        pend = getattr(self, "pending_select", None)
+        self.pending_select = None
         self.light_sig = self.sig(devs)
         self.fill_devs()
         self.update_default_name()
         self.inputs_changed()
+        if pend:
+            d = next((x for x in devs if x["path"] == pend[1]), None)
+            if d and not d["busy"]:
+                self.select_dev(*pend)
 
     @staticmethod
     def sig(devs) -> str:
         return "|".join(f"{d['path']}:{d['size']}:{d['fstype']}:{','.join(d['mounts'])}" for d in devs)
 
     def fill_devs(self) -> None:
-        self.src_devs.set_devices(self.devs, self.src_sel, self.dst_sel, self.usage)
-        self.dst_devs.set_devices(self.devs, self.dst_sel, self.src_sel, self.usage)
+        dst = [self.dst_sel] if self.dst_sel else []
+        self.src_devs.set_devices(self.devs, self.src_sels, dst, self.usage)
+        self.dst_devs.set_devices(self.devs, dst, self.src_sels, self.usage)
 
     def set_usage(self, path: str, used, total) -> None:
         text = f"{E.human(used)} {used * 100 / max(total or 1, 1):.0f}%" if used is not None else "-"
@@ -929,26 +959,186 @@ class SetupPage(Gtk.Box):
         self.dst_devs.set_usage(path, text)
 
     def select_dev(self, side: str, path: str) -> None:
+        """Click on a device: select it, or unselect it when it is already selected. In Disk ->
+        Image several sources can be selected (one backup each)."""
         d = next((x for x in self.devs if x["path"] == path), None)
         if not d:
             return
+        if side == "src" and path in self.src_sels:
+            self.src_sels.remove(path)
+            self.after_selection()
+            return
+        if side == "dst" and path == self.dst_sel:
+            self.dst_sel = None
+            self.after_selection()
+            return
         if d["busy"]:
-            self.win.toast(f"{d['path']} is {d['busy']}. Unmount it first.")
+            if d["busy"].startswith("mounted"):
+                def flow():
+                    c = yield alert(self.win, f"{d['path']} is mounted",
+                                    f"{d['busy']}.\nIt has to be unmounted before it can be used here. Close "
+                                    "programs that still show files from it first.",
+                                    [("unmount", "Unmount", "suggested")])
+                    if c == "unmount":
+                        ok = yield self.unmount(d)
+                        if ok:
+                            self.pending_select = (side, path)
+                run_flow(flow(), lambda e: self.win.toast(e))
+            else:
+                self.win.toast(f"{d['path']} is {d['busy']}.")
             return
         if side == "dst" and d["ro"]:
             self.win.toast(f"{d['path']} is read-only.")
             return
         if side == "src":
-            self.src_sel = path
+            if self.mode == "d2i":
+                self.src_sels = [p for p in self.src_sels if not self._related(p, path)] + [path]
+            else:
+                self.src_sels = [path]
             if self.dst_sel and self._related(path, self.dst_sel):
                 self.dst_sel = None
         else:
             self.dst_sel = path
-            if self.src_sel and self._related(path, self.src_sel):
-                self.src_sel = None
+            self.src_sels = [p for p in self.src_sels if not self._related(path, p)]
+        self.after_selection()
+
+    def after_selection(self) -> None:
+        if self.mode == "d2i":
+            self.dst_title.set_markup("<b>Save the backups in folder</b>" if len(self.src_sels) > 1
+                                      else "<b>Save backup as</b>")
         self.fill_devs()
         self.update_default_name()
         self.inputs_changed()
+
+    # ---------------------------------------------------------------- mount / unmount / properties
+    def device_menu(self, path: str, widget: Gtk.Widget, x: float, y: float) -> None:
+        d = next((x_ for x_ in self.devs if x_["path"] == path), None)
+        if not d:
+            return
+        by = {x_["path"]: x_ for x_ in self.devs}
+        mounted = [x_ for x_ in self.devs if x_["mounts"] and (x_["path"] == path or self._related(x_["path"], path))
+                   and self._is_below(x_["path"], path, by)]
+        menu = Gio.Menu()
+        group = Gio.SimpleActionGroup()
+
+        def add(name, label_, cb, enabled=True):
+            a = Gio.SimpleAction.new(name, None)
+            a.set_enabled(enabled)
+            a.connect("activate", lambda *_: cb())
+            group.add_action(a)
+            menu.append(label_, f"dev.{name}")
+        can_mount = bool(d["fstype"]) and d["fstype"] not in ("swap", "linux_raid_member", "LVM2_member",
+                                                             "crypto_LUKS") and not d["mounts"]
+        add("unmount", "Unmount", lambda: run_flow(self._menu_unmount(d), self.win.toast), bool(mounted))
+        add("mount_ro", "Mount read-only", lambda: self.mount(d, True), can_mount)
+        add("mount_rw", "Mount read/write", lambda: self.mount(d, False), can_mount)
+        add("props", "Properties", lambda: self.properties(d))
+        widget.insert_action_group("dev", group)
+        pop = Gtk.PopoverMenu.new_from_model(menu)
+        pop.set_parent(widget)
+        pop.set_has_arrow(False)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(lambda: (p.unparent(), False)[1]))
+        pop.popup()
+        self.last_menu = pop
+
+    @staticmethod
+    def _is_below(node: str, top: str, by: dict) -> bool:
+        p = node
+        while p:
+            if p == top:
+                return True
+            p = by.get(p, {}).get("parent")
+        return False
+
+    def _menu_unmount(self, d: dict):
+        yield self.unmount(d)
+
+    def _run(self, argv: list[str]) -> Pending:
+        """Run a command as the desktop user (udisks asks for authorization itself if needed)."""
+        p = Pending()
+        try:
+            proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE)
+        except GLib.Error as e:
+            p.resolve((False, e.message))
+            return p
+
+        def fin(pr, res):
+            try:
+                _ok, out, err = pr.communicate_utf8_finish(res)
+            except GLib.Error as e:
+                p.resolve((False, e.message))
+                return
+            p.resolve((pr.get_successful(), ((err or "") + (out or "")).strip()))
+        proc.communicate_utf8_async(None, None, fin)
+        return p
+
+    def unmount(self, d: dict) -> Pending:
+        """Unmount d and everything mounted below it. Resolves with True on success."""
+        result = Pending()
+        by = {x["path"]: x for x in self.devs}
+        nodes = sorted((x for x in self.devs if x["mounts"] and self._is_below(x["path"], d["path"], by)),
+                       key=lambda x: -x["depth"])
+
+        def flow():
+            for x in nodes:
+                ok, msg = yield self._run(E.unmount_cmd(x["path"]))
+                if not ok:
+                    self.win.toast(f"{x['path']} could not be unmounted: {msg.splitlines()[-1] if msg else '?'}",
+                                   timeout=10)
+                    result.resolve(False)
+                    self.win.load_devices(full=True)
+                    return
+            self.win.toast(f"{d['path']} unmounted.")
+            result.resolve(True)
+            self.win.load_devices(full=True)
+        if not E.shutil.which("udisksctl"):
+            self.win.toast("udisks is not installed (pacman -S udisks2).")
+            result.resolve(False)
+            return result
+        run_flow(flow(), lambda e: (self.win.toast(e), result.resolve(False)))
+        return result
+
+    def mount(self, d: dict, readonly: bool) -> None:
+        if not E.shutil.which("udisksctl"):
+            self.win.toast("udisks is not installed (pacman -S udisks2).")
+            return
+
+        def flow():
+            ok, msg = yield self._run(E.mount_cmd(d["path"], readonly))
+            if ok:
+                self.win.toast(f"{d['path']} mounted" + (" read-only." if readonly else " read/write."))
+            else:
+                self.win.toast(f"{d['path']} could not be mounted: {msg.splitlines()[-1] if msg else '?'}",
+                               timeout=10)
+            self.win.load_devices(full=True)
+        run_flow(flow(), lambda e: self.win.toast(e))
+
+    def properties(self, d: dict) -> None:
+        """Mounted: the file manager's properties dialog (Nautilus, Dolphin ...); else device facts."""
+        if d["mounts"]:
+            uri = Gio.File.new_for_path(d["mounts"][0]).get_uri()
+            try:
+                bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                              "org.freedesktop.FileManager1", "ShowItemProperties",
+                              GLib.Variant("(ass)", ([uri], "")), None, Gio.DBusCallFlags.NONE, 5000, None)
+                return
+            except GLib.Error:
+                pass
+        rows = [("Device", d["path"]), ("Size", f"{E.human(d['size'])} ({d['size']:,} bytes)"),
+                ("Type", d["kind"]), ("Label", d["label"] or "-"), ("Filesystem", d["fstype"] or "-"),
+                ("UUID", d["uuid"] or "-"), ("Model", d["model"] or "-"), ("Serial number", d["serial"] or "-"),
+                ("Partition table", (d["pttype"] or "-").upper()), ("Connection", d["tran"] or "-"),
+                ("Mounted at", ", ".join(d["mounts"]) or "not mounted"),
+                ("Status", d["busy"] or ("read-only" if d["ro"] else "ok"))]
+        grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+        for i, (k, v) in enumerate(rows):
+            grid.attach(label(k, css=("dim-label",)), 0, i, 1, 1)
+            grid.attach(label(v, selectable=True, wrap=True), 1, i, 1, 1)
+        alert(self.win, f"Properties of {d['path']}", "", [], extra=grid)
 
     def _related(self, a: str, b: str) -> bool:
         by = {d["path"]: d for d in self.devs}
@@ -972,7 +1162,15 @@ class SetupPage(Gtk.Box):
                 return
             ext = Path(new_name).suffix
             cur = self.dst_path.get_text().strip()
-            if not cur:
+            if len(self.src_sels) > 1:
+                # several sources: the field holds the folder; every backup gets its own name
+                if cur.endswith((".img", E.CONTAINER_EXT)):
+                    self.dst_path.set_text(str(Path(cur).parent))
+                self.default_name = ""
+                return
+            if cur and Path(cur).is_dir() and not cur.endswith((".img", E.CONTAINER_EXT)):
+                self.dst_path.set_text(str(Path(cur) / new_name))
+            elif not cur:
                 self.dst_path.set_text(str(Path("/mnt") / new_name))
             elif self.default_name and Path(cur).name == self.default_name:
                 self.dst_path.set_text(str(Path(cur).parent / new_name))
@@ -982,7 +1180,7 @@ class SetupPage(Gtk.Box):
                         self.dst_path.set_text(cur[: -len(old)] + ext)
                         break
             self.default_name = new_name
-        self.win.helper.call("default_name", src_dev=self.src_sel or "", plan=pi).then(
+        self.win.helper.call("default_name", src_dev=self.src_sels[0] if self.src_sels else "", plan=pi).then(
             lambda ok, v: GLib.idle_add(lambda: (got(ok, v), False)[1]))
 
     # ---------------------------------------------------------------- browse list
@@ -1064,6 +1262,9 @@ class SetupPage(Gtk.Box):
             except GLib.Error:
                 return
             if f and f.get_path():
+                if len(self.src_sels) > 1:
+                    self.dst_path.set_text(f.get_path())
+                    return
                 cur = self.dst_path.get_text().strip()
                 name = Path(cur).name if cur else (self.default_name or "disk.img")
                 if f.get_path().endswith(E.CONTAINER_EXT):
@@ -1137,7 +1338,7 @@ class RunPage(Gtk.Box):
 
     COLS = ("Item", "Device", "Size", "FS", "Method", "Copy", "Verify")
 
-    def begin(self, st: dict) -> None:
+    def begin(self, st: dict, keep_log: bool = False) -> None:
         self.running = True
         self.info.set_markup(pango("\n".join(st["info"])))
         clear_box(self.steps_box)
@@ -1167,7 +1368,8 @@ class RunPage(Gtk.Box):
         self.verify_info.set_text("waiting")
         self.phase.set_text("")
         clear_box(self.stats)
-        self.log.clear()
+        if not keep_log:
+            self.log.clear()
         self.result.set_markup("<b>Running…</b>")
         self.stop_btn.set_sensitive(True)
         self.skip_btn.set_sensitive(False)
@@ -1653,6 +1855,8 @@ class MainWindow(Adw.ApplicationWindow):
             (rp.skip_btn if ev["name"] == "skip" else rp.stop_btn).set_sensitive(bool(ev["enabled"]) and rp.running)
         elif name == "usage":
             self.setup.set_usage(ev["path"], ev.get("used"), ev.get("total"))
+        elif name == "begin":                     # next backup of a batch
+            rp.begin(ev["info"], keep_log=True)
         elif name == "done":
             self.job_done(ev)
 
