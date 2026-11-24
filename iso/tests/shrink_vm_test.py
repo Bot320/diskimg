@@ -3,8 +3,8 @@
 """Automated VM test of restoring onto a smaller disk. Run on the host (outside any sandbox; needs
 KVM and QEMU):   python3 -I iso/tests/shrink_vm_test.py ISO [WORKDIR]
 
-Boots the rescue ISO with a work disk (this repository's diskimg code + shrink_inner.py), a 1 GiB
-source disk and a 900 MiB target disk, runs the test as root inside the VM and prints the result."""
+Boots the rescue ISO with a work disk (this repository's diskimg code + shrink_inner.py), a 640 MiB
+source disk and a 560 MiB target disk, runs the test as root inside the VM and prints the result."""
 import os
 import shutil
 import subprocess
@@ -32,7 +32,10 @@ def main() -> int:
                     ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy(HERE / "shrink_inner.py", work / "wd" / "inner.py")
     (work / "wd" / "run.sh").write_text("python3 -I /mnt/inner.py > /mnt/inner.out 2>&1\nsync\npoweroff\n")
-    disks = {"work.img": 3072, "src.img": 1024, "tgt.img": 900}
+    disks = {"work.img": 2048, "src.img": 640, "tgt.img": 560}
+    free = shutil.disk_usage(work).free
+    if free < 1600 * 1024 * 1024:
+        sys.exit(f"not enough free space for the test disks in {work}: {free // 2**20} MiB (needs 1600)")
     for name, mib in disks.items():
         with open(work / name, "wb") as f:
             f.truncate(mib * 1024 * 1024)

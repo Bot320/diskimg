@@ -2,7 +2,7 @@
 """Runs INSIDE the rescue-ISO VM as root (started by shrink_vm_test.py): restore onto a smaller disk.
 
 Disks: /dev/vda = work disk (this script, the diskimg code under /mnt/app, results),
-/dev/vdb = 1 GiB source disk, /dev/vdc = 900 MiB target disk.
+/dev/vdb = 640 MiB source disk, /dev/vdc = 560 MiB target disk.
 For two layouts: partition and fill the source, back it up (filesystem-aware), restore it onto the
 smaller target, then compare every file and check the filesystems. Results go to /mnt/result.txt."""
 import hashlib
@@ -82,7 +82,7 @@ def mount(dev, fs, mp, ro=False):
     if fs == "ntfs":
         sh("ntfs-3g", "-o", "ro" if ro else "rw", dev, mp)
     else:
-        sh("mount", "-o", "ro" if ro else "rw", dev, mp)
+        sh("mount", "-t", fs, "-o", "ro" if ro else "rw", dev, mp)
 
 
 def umount(mp):
@@ -93,27 +93,41 @@ def make_source(scenario: str) -> dict:
     sh("wipefs", "-a", SRC, check_rc=False)
     sh("sgdisk", "-Z", SRC, check_rc=False)
     if scenario == "ntfs":     # Windows-like: EFI, MSR, C: (NTFS, big), Linux data (ext4) at the end
-        sh("sgdisk", "-n1:2048:+100M", "-t1:ef00", "-n2:0:+16M", "-t2:0c01", "-n3:0:-200M", "-t3:0700",
+        sh("sgdisk", "-n1:2048:+100M", "-t1:ef00", "-n2:0:+16M", "-t2:0c01", "-n3:0:-128M", "-t3:0700",
            "-c3:Windows", "-n4:0:0", "-t4:8300", "-c4:Linux", SRC)
         fs = {1: "vfat", 3: "ntfs", 4: "ext4"}
     else:                      # Linux-like: EFI, root (ext4, big), Windows data (NTFS) at the end
-        sh("sgdisk", "-n1:2048:+100M", "-t1:ef00", "-n2:0:-200M", "-t2:8300", "-c2:Root",
+        sh("sgdisk", "-n1:2048:+100M", "-t1:ef00", "-n2:0:-128M", "-t2:8300", "-c2:Root",
            "-n3:0:0", "-t3:0700", "-c3:Data", SRC)
         fs = {1: "vfat", 2: "ext4", 3: "ntfs"}
+    sh("blockdev", "--rereadpt", SRC, check_rc=False)
     settle(SRC)
+    for n in fs:                     # wait until the kernel and udev show every new partition
+        for _ in range(60):
+            dev = f"{SRC}{n}"
+            if os.path.exists(dev) and os.path.exists(f"/sys/class/block/{Path(dev).name}"):
+                break
+            time.sleep(0.5)
+            settle(SRC)
+        else:
+            raise RuntimeError(f"{SRC}{n} did not appear")
     expect = {}
     for n, t in fs.items():
         dev = f"{SRC}{n}"
+        sh("wipefs", "-a", dev, check_rc=False)
         if t == "vfat":
             sh("mkfs.fat", "-F32", "-n", "EFI", dev)
         elif t == "ntfs":
             sh("mkntfs", "-Q", "-L", "Windows" if scenario == "ntfs" else "Data", dev)
         else:
             sh("mkfs.ext4", "-q", "-F", "-L", "Linux" if scenario == "ntfs" else "Root", dev)
+        got = sh("blkid", "-p", "-o", "value", "-s", "TYPE", dev, check_rc=False).stdout.strip()
+        if got != t:
+            raise RuntimeError(f"{dev}: formatted as {t}, but blkid sees {got!r}")
         mp = f"/tmp/src{n}"
         mount(dev, t, mp)
         size_mb = int(sh("blockdev", "--getsize64", dev).stdout) // (1024 * 1024)
-        fill(Path(mp), int(size_mb * (0.85 if t != "vfat" else 0.3)), seed=n)
+        fill(Path(mp), int(size_mb * (0.6 if t != "vfat" else 0.3)), seed=n)
         expect[n] = (t, sums(Path(mp)))
         umount(mp)
     sh("sync")
@@ -145,7 +159,7 @@ def scenario(name: str) -> bool:
     sp = jobs[0].shrink
     ok &= check(sp is not None, f"restore planned with shrinking: partition {sp.part if sp else '-'} "
                                 f"{E.human(sp.old_size) if sp else ''} -> {E.human(sp.new_size) if sp else ''}")
-    ok &= check(style == "$success", f"restore onto the 900 MiB disk: {res}")
+    ok &= check(style == "$success", f"restore onto the 560 MiB disk: {res}")
     settle(TGT)
     ok &= check(sh("sfdisk", "--verify", TGT, check_rc=False).returncode == 0, "partition table verifies")
     for n, (t, want) in expect.items():
@@ -161,6 +175,7 @@ def scenario(name: str) -> bool:
         got = sums(Path(mp))
         umount(mp)
         ok &= check(got == want, f"partition {n} ({t}): all {len(want)} files identical")
+    shutil.rmtree(bk, ignore_errors=True)            # keep the work disk small
     return ok
 
 
