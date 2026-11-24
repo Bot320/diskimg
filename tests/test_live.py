@@ -69,6 +69,20 @@ def main() -> int:
         check(st["file_bytes"] < src.stat().st_size / 2,
               f"compression {E.ratio_text(last[4], last[3])}")
 
+        # restore and target check count bytes of data, not chunk numbers
+        tgt = work / "restored.img"
+        tgt.write_bytes(b"")
+        os.truncate(tgt, src.stat().st_size)
+        rc = []
+        E.chunked_restore(work / "d.chunks", work / "d.cidx", str(tgt), 0, src.stat().st_size,
+                          threading.Event(), lambda *a: rc.append(a))
+        check(rc[-1] == (src.stat().st_size, src.stat().st_size) and tgt.read_bytes() == src.read_bytes(),
+              f"restore progress ends at {E.human(rc[-1][0])} of {E.human(rc[-1][1])}")
+        vc = []
+        bad = E.chunked_verify_target(work / "d.cidx", str(tgt), 0, threading.Event(), lambda *a: vc.append(a))
+        check(not bad and vc[-1] == (src.stat().st_size, src.stat().st_size),
+              f"target check progress ends at {E.human(vc[-1][0])} of {E.human(vc[-1][1])}")
+
         # the runner keeps sending progress (clock running) while the copy is stuck in a write
         job = E.Job(mode="d2i", method="fs", src=str(src), dst=str(work / "x"), src_label="s",
                     dst_label="d", src_dev=None, dst_dev=None, size=1, engine="container",

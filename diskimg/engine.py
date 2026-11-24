@@ -35,7 +35,7 @@ from pathlib import Path
 from rich.markup import escape
 from rich.text import Text
 
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 STATE_DIR = Path("/var/lib/diskimg")
 MAP_DIR = STATE_DIR / "maps"
 LOG_DIR = Path("/var/log/diskimg")
@@ -1569,6 +1569,10 @@ class ChunkIndex:
     def entry(self, i: int) -> tuple[int, int, int, int, bytes]:
         return IDX_ENT.unpack_from(self.buf, IDX_HDR.size + i * IDX_ENT.size)
 
+    def used_bytes(self) -> int:
+        """Bytes a restore writes / a target check reads (all chunks that are not absent)."""
+        return sum(self.entry(i)[2] for i in range(self.count) if self.entry(i)[3] != F_ABSENT)
+
     def stats(self) -> dict:
         c = {F_ABSENT: 0, F_ZSTD: 0, F_ZERO: 0, F_PLAIN: 0}
         for i in range(self.count):
@@ -1920,6 +1924,7 @@ def chunked_restore(data_path: Path, index_path: Path, node: str, base: int, lim
         raise ChunkError(errno.ENOSPC, f"image ({idx.size} B) larger than target area ({limit} B)")
     fd = os.open(node, os.O_WRONLY | os.O_CLOEXEC)
     done = flushed = 0
+    total = idx.used_bytes()          # progress in bytes of data written (not chunk numbers)
     try:
         for i, off, usz, flag, h, data, _raw in _pipeline_chunks(Path(data_path), idx, cancel):
             if flag == F_ABSENT:
@@ -1933,12 +1938,12 @@ def chunked_restore(data_path: Path, index_path: Path, node: str, base: int, lim
                 os.fdatasync(fd)
                 flushed = done
             if progress and i % 8 == 0:
-                progress(i + 1, idx.count)
+                progress(done, total)
         os.fsync(fd)
     finally:
         os.close(fd)
     if progress:
-        progress(idx.count, idx.count)
+        progress(total, total)
 
 
 def chunked_verify_target(index_path: Path, node: str, base: int, cancel: threading.Event,
@@ -1947,6 +1952,7 @@ def chunked_verify_target(index_path: Path, node: str, base: int, cancel: thread
     idx = ChunkIndex(index_path)
     fd = os.open(node, os.O_RDONLY | os.O_CLOEXEC)
     bad: list[int] = []
+    done, total = 0, idx.used_bytes()
     try:
         try:
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -1961,12 +1967,13 @@ def chunked_verify_target(index_path: Path, node: str, base: int, cancel: thread
             got = os.pread(fd, usz, base + i * idx.chunk)
             if len(got) != usz or chunk_hash(got) != h:
                 bad.append(i)
+            done += usz
             if progress and i % 8 == 0:
-                progress(i + 1, idx.count)
+                progress(done, total)
     finally:
         os.close(fd)
     if progress:
-        progress(idx.count, idx.count)
+        progress(total, total)
     return bad
 
 
@@ -4996,8 +5003,8 @@ class JobRunner:
     #  chunked format (v3)
     # ======================================================================
     def chunk_progress(self, label: str, weight: int, bar: str):
-        """Progress callback for the chunked engine: prog(done, total, bad=0, written=None,
-        packed_in=None); written/packed_in (backups) = bytes stored so far / data they hold."""
+        """Progress callback for the chunked engine, all values in bytes: prog(done, total, bad=0,
+        written=None, packed_in=None); written/packed_in (backups) = bytes stored so far / data they hold."""
         last = [0.0]
         meter = RateMeter()
         state: list = [0, 1, 0, None, None]
@@ -5008,7 +5015,7 @@ class JobRunner:
             frac = max(0.0, min(1.0, done / max(total, 1)))
             overall = (self.w_done + weight * frac) / max(self.w_total, 1)
             el = now - self.phase_t0
-            rate = meter.rate(done) if total > 1000 else 0
+            rate = meter.rate(done)
             eta = el * (1 - overall) / overall if overall > 0.02 else None
             badt = self.bad_total + bad
             if bar == "copy":
@@ -5016,9 +5023,8 @@ class JobRunner:
                     ("Item", label), ("Item progress", f"{frac * 100:5.1f}%"),
                     ("Total", f"{overall * 100:5.1f}%"),
                     ("Elapsed", fmt_dur(el)), ("Remaining", fmt_dur(eta)),
-                    ("Rate", f"{human(rate)}/s" if total > 1000 else "-"),
-                    ("Processed", (f"{human(done)} of {human(total)}") if total > 1000
-                     else f"{done}/{total} chunks")]
+                    ("Rate", f"{human(rate)}/s"),
+                    ("Processed", f"{human(done)} of {human(total)}")]
                 if written is not None:
                     pairs.append(("Written", human(written)))
                     pairs.append(("Compression", ratio_text(packed_in or 0, written)))
