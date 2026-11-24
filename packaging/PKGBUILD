@@ -7,7 +7,7 @@ pkgdesc="Disk imaging for Arch Linux: GTK 4 app with text-interface fallback (dd
 arch=('any')
 url="https://github.com/Bot320/diskimg"
 license=('GPL-3.0-only')
-depends=('python' 'python-textual' 'python-rich' 'ddrescue' 'gptfdisk' 'partclone' 'ntfs-3g' 'zstd'
+depends=('python' 'python-textual' 'python-rich' 'ddrescue' 'gptfdisk' 'partclone' 'ntfs-3g' 'ntfsprogs' 'zstd'
          'gnupg' 'util-linux' 'e2fsprogs' 'polkit')
 optdepends=('python-gobject: graphical interface'
             'gtk4: graphical interface'

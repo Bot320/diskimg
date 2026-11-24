@@ -35,6 +35,7 @@ f2fs-tools
 jfsutils
 xfsprogs
 ntfs-3g
+ntfsprogs
 lvm2
 mdadm
 dmraid

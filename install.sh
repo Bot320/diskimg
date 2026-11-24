@@ -60,7 +60,7 @@ fi
 # ---------------------------------------------------------------- packages
 live=0
 [ -d /run/archiso ] && live=1
-pkgs=(python python-textual python-rich ddrescue gptfdisk partclone ntfs-3g zstd gnupg cifs-utils nfs-utils
+pkgs=(python python-textual python-rich ddrescue gptfdisk partclone ntfs-3g ntfsprogs zstd gnupg cifs-utils nfs-utils
       restic fuse3 python-pyfuse3 python-trio util-linux e2fsprogs curl tar)
 # the GUI is skipped on the live ISO (no desktop there, and RAM is precious) unless asked for
 if [ "$live" -eq 0 ] || [ "${DISKIMG_GUI:-0}" = 1 ]; then

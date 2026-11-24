@@ -2979,6 +2979,7 @@ class Job:
     browse_ids: list[str] = field(default_factory=list)
     keep_cache: bool = False
     fileset: dict | None = None
+    shrink: "ShrinkPlan | None" = None    # restore onto a smaller disk (see shrink_plan)
 
     @property
     def dst_is_dev(self) -> bool:
@@ -4118,8 +4119,19 @@ class JobRunner:
                     raise JobFailed("Wrong passphrase.")
         self.lock_dev(target)
         tsize = dev_size(target)
+        sp = None
+        shrink_dir = None
         if tsize < lay.needed:
-            raise JobFailed(f"Target too small: needs {human(lay.needed)}, has {human(tsize)}.")
+            if clone or j.method != "fs":
+                raise JobFailed(f"Target too small: needs {human(lay.needed)}, has {human(tsize)}.")
+            try:
+                sp = shrink_plan(lay, items, tsize, cdir)
+                shrink_dir = shrink_tmp_dir(cdir, sp.tmp_need)
+            except ValueError as e:
+                raise JobFailed(f"Target too small: needs {human(lay.needed)}, has {human(tsize)}. {e}")
+            for line in shrink_lines(sp):
+                self.log(line)
+            self._table_changed = True
         if lay.kind == "disk":
             if j.dst_dev.kind == "part":
                 raise JobFailed("A whole-disk backup needs a whole disk as target.")
@@ -4160,7 +4172,7 @@ class JobRunner:
         if lay.kind == "disk":
             self.set_step("table", "run")
             self.check_stop()
-            nodes = self.write_table(j, lay, items, source_for, man, cdir)
+            nodes = self.write_table(j, lay, items, source_for, man, cdir, sp)
             self.set_step("table", "done")
             for it in items:
                 if it.get("part") is not None:
@@ -4174,7 +4186,10 @@ class JobRunner:
         for it in data_items:
             self.check_stop()
             node = nodes.get(it["part"]) if lay.kind == "disk" else target
-            if it["method"] == "skip":
+            if it["method"] == "skip" or it.get("_done"):
+                continue
+            if sp is not None and it["role"] == "part" and it["part"] == sp.part:
+                self._restore_shrunk(j, it, node, sp, lay, items, source_for, cdir, shrink_dir, target)
                 continue
             if it["method"] == "swap":
                 cmd = ["mkswap", "-U", it.get("uuid") or "random"]
@@ -4236,6 +4251,16 @@ class JobRunner:
             self.set_step("verify", {"ok": "done", "skipped": "skip"}.get(vstate, "fail"))
         if self.quit_after:
             return "STOPPED", "$warning"
+        if sp is not None:
+            # NTFS partitions that moved forward: their boot sector records the partition start
+            for p in lay.parts:
+                newstart = sp.new_parts.get(p.number, [p.start])[0]
+                if p.fstype == "ntfs" and newstart != p.start and p.number in nodes:
+                    try:
+                        patch_ntfs_start(nodes[p.number], newstart // lay.sector_size)
+                        self.log(f"Partition {p.number} moved: NTFS start position updated.")
+                    except OSError as e:
+                        self.log(f"[$warning]Partition {p.number}: NTFS start position not updated ({e}).[/]")
 
         gpt_note = ""
         if j.method == "raw":
@@ -4269,11 +4294,12 @@ class JobRunner:
                 raise JobFailed(f"{e}. Another program opened the target meanwhile.")
             raise
 
-    def write_table(self, j: Job, lay: Layout, items, source_for, man, cdir) -> dict:
+    def write_table(self, j: Job, lay: Layout, items, source_for, man, cdir, sp: ShrinkPlan | None = None) -> dict:
         target = j.dst
         tsize = dev_size(target)
         boot = next(i for i in items if i["role"] == "boot")
-        end = max(p.start + p.size for p in lay.parts)
+        pos = {p.number: tuple(sp.new_parts[p.number]) if sp else (p.start, p.size) for p in lay.parts}
+        end = max(st + sz for st, sz in pos.values())
         # remove stale GPT backup / signatures at the end of the target
         tail_start = max(end, tsize - MIB)
         zero_range(target, tail_start, tsize - tail_start)
@@ -4292,7 +4318,31 @@ class JobRunner:
         boot["stream_bytes"] = hstream.n
         self.item_row("boot", {"Device": target, "Copy": f"ok {human(boot['length'])}"})
         self.log(f"Boot area written ({human(boot['length'])}).")
-        if lay.label == "gpt":
+        if sp is not None:
+            # new layout: the saved table with the new positions, written by sfdisk; the boot code
+            # in the first 440 bytes stays as restored
+            dump = lay.sfdisk_dump if j.mode == "d2d" else (cdir / "ptable.sfdisk").read_text()
+            dump = adjust_sfdisk_dump(dump, sp.new_parts, lay.sector_size)
+            fd = os.open(target, os.O_RDWR | os.O_CLOEXEC)
+            try:
+                code = os.pread(fd, 440, 0)
+            finally:
+                os.close(fd)
+            r = run(["sfdisk", "-q", "--no-reread", "--no-tell-kernel", "--wipe", "never", target],
+                    timeout=120, inp=dump)
+            if r.returncode != 0:
+                raise JobFailed(f"sfdisk failed: {(r.stdout + r.stderr).strip()}")
+            fd = os.open(target, os.O_RDWR | os.O_CLOEXEC)
+            try:
+                pwrite_all(fd, code, 0)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            v = run(["sfdisk", "--verify", target], timeout=120)
+            if v.returncode != 0:
+                raise JobFailed(f"Partition table check failed: {(v.stdout + v.stderr).strip()}")
+            self.log("Partition table written with the new layout (sfdisk --verify: ok).")
+        elif lay.label == "gpt":
             r = run(["sgdisk", "-e", target], timeout=120)
             if r.returncode != 0:
                 raise JobFailed(f"sgdisk -e failed: {(r.stdout + r.stderr).strip()}")
@@ -4318,12 +4368,93 @@ class JobRunner:
                 raise JobFailed(f"Partition {p.number} did not appear on the target after writing the "
                                 f"partition table.")
             node, start, size = parts[p.number]
-            if start != p.start or size != p.size:
-                raise JobFailed(f"{node}: start/size differ from the backup "
-                                f"({start}/{size} vs {p.start}/{p.size}).")
+            want_start, want_size = pos[p.number]
+            if start != want_start or size != want_size:
+                raise JobFailed(f"{node}: start/size differ from the planned layout "
+                                f"({start}/{size} vs {want_start}/{want_size}).")
             nodes[p.number] = node
         self.log("Partitions on target: " + ", ".join(f"{n}={v}" for n, v in sorted(nodes.items())))
         return nodes
+
+    def _restore_shrunk(self, j: Job, it: dict, node: str, sp: ShrinkPlan, lay: Layout, items: list[dict],
+                        source_for, cdir: Path, tmpdir: Path, target: str) -> None:
+        """Restore the partition that is made smaller (see shrink_plan) and shrink its filesystem."""
+        self._table_changed = True
+        tail = sp.old_size - sp.new_size
+        tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tf = tmpdir / f"diskimg-shrink-{os.getpid()}.tail"
+        fd = os.open(tf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.ftruncate(fd, tail)
+        finally:
+            os.close(fd)
+        loop = None
+        name = f"diskimg-shrink-{os.getpid()}"
+        self.log(f"{it['id']}: restoring at the original size {human(sp.old_size)}; the last "
+                 f"{human(tail)} are kept in {tf} for now.")
+        try:
+            r = run(["losetup", "-f", "--show", str(tf)], timeout=60)
+            if r.returncode != 0:
+                raise JobFailed(f"losetup failed: {(r.stderr or r.stdout).strip()}")
+            loop = r.stdout.strip()
+            table = (f"0 {sp.new_size // 512} linear {node} 0\n"
+                     f"{sp.new_size // 512} {tail // 512} linear {loop} 0\n")
+            with self.unlocked(target):           # device-mapper claims the partition itself
+                r = run(["dmsetup", "create", name], timeout=60, inp=table)
+                if r.returncode != 0:
+                    raise JobFailed(f"dmsetup failed: {(r.stderr or r.stdout).strip()}")
+                dm = f"/dev/mapper/{name}"
+                try:
+                    if it["method"] == "chunks":
+                        if not self._restore_chunked(it, dm, sp.old_size, cdir):
+                            raise JobFailed(f"{it['id']} could not be written. The target is incomplete.")
+                    elif not self._write_item(j, it, dm, sp.old_size, source_for, False):
+                        raise JobFailed(f"{it['id']} could not be written. The target is incomplete.")
+                    for nb in items:
+                        if nb["role"] == "ntfsbak" and nb.get("part") == sp.part and nb["method"] != "skip":
+                            if not self._write_item(j, nb, dm, sp.old_size, source_for, False):
+                                raise JobFailed(f"{nb['id']} could not be written.")
+                            nb["_done"] = True
+                            nb["_verified"] = (True, "")   # rewritten by the resize
+                    err = fsync_path(dm)
+                    if err:
+                        raise JobFailed(f"Flushing failed: {err}")
+                    if j.verify:
+                        self.item_row(it["id"], {"Verify": "checking"})
+                        drop_cache(dm)
+                        res, why = self._verify_item(j, lay, it, {sp.part: dm}, target)
+                        if res is False:
+                            it["_verified"] = (False, why)
+                            raise JobFailed(f"{it['id']}: the restored data differs from the backup ({why}).")
+                        it["_verified"] = (True, "") if res is True else ("skipped", "")
+                        self.item_row(it["id"], {"Verify": "ok" if res is True else "skipped"})
+                    self.item_row(it["id"], {"Copy": "making smaller"})
+                    try:
+                        shrink_filesystem(sp.fstype, dm, sp.new_size, self.log)
+                    except ValueError as e:
+                        raise JobFailed(f"{it['id']}: {e}")
+                    err = fsync_path(dm)
+                    if err:
+                        raise JobFailed(f"Flushing failed: {err}")
+                finally:
+                    run(["dmsetup", "remove", "--retry", name], timeout=120)
+        finally:
+            if loop:
+                run(["losetup", "-d", loop], timeout=60)
+            try:
+                tf.unlink()
+            except OSError:
+                pass
+            try:
+                tmpdir.rmdir()
+            except OSError:
+                pass
+        drop_cache(node)
+        prob = check_filesystem(sp.fstype, node)
+        if prob:
+            raise JobFailed(f"{it['id']}: the smaller filesystem does not check out: {prob}")
+        self.item_row(it["id"], {"Copy": f"ok, made smaller to {human(sp.new_size)}"})
+        self.log(f"[$success]{it['id']}: restored and made smaller to {human(sp.new_size)}; filesystem check ok.[/]")
 
     def _write_item(self, j: Job, it: dict, node: str, psize: int, source_for, clone: bool) -> bool:
         self.item_row(it["id"], {"Copy": "running", "Device": node,
@@ -4380,7 +4511,10 @@ class JobRunner:
                 return "skipped"
             self.check_stop()
             self.item_row(it["id"], {"Verify": "checking"})
-            res, why = self._verify_item(j, lay, it, nodes, target)
+            if "_verified" in it:                 # checked before it was made smaller
+                res, why = it["_verified"]
+            else:
+                res, why = self._verify_item(j, lay, it, nodes, target)
             if res == "skipped":
                 return "skipped"
             self.item_row(it["id"], {"Verify": "ok" if res else "BAD"})
@@ -4396,6 +4530,15 @@ class JobRunner:
     def _verify_item(self, j, lay, it, nodes, target) -> tuple[bool | str, str]:
         node = nodes.get(it.get("part")) if lay.kind == "disk" else target
         w = self.item_weight(it)
+        if it["role"] == "boot" and getattr(self, "_table_changed", False):
+            # new layout: compare the boot code, and check the rewritten partition table
+            self.w_done += w
+            src_boot = self.boot_bytes(j, it)
+            with open(target, "rb") as f:
+                got = f.read(440)
+            v = run(["sfdisk", "--verify", target], timeout=120)
+            ok = src_boot is not None and got == src_boot[:440] and v.returncode == 0
+            return ok, "boot code or new partition table differs"
         if it["role"] == "boot":
             want_len = it["length"]
             # GPT: sector 1 (header) and the protective MBR size field change with the disk size
@@ -5063,6 +5206,232 @@ class JobRunner:
 
 
 
+# ----------------------------------------------------------------------------
+#  Restoring onto a smaller disk ("shrink on restore")
+#
+#  A filesystem-aware backup of a whole disk can go onto a smaller disk when the data fits:
+#  one partition (NTFS, ext2/3/4 or btrfs) is made smaller and the partitions behind it move
+#  forward. That partition is restored through a temporary device-mapper device of its original
+#  size: the first part is the (smaller) partition on the target, the cut-off rest a sparse
+#  temporary file. Then the filesystem is shrunk until it fits, and the temporary device removed.
+# ----------------------------------------------------------------------------
+SHRINKABLE_FS = ("ntfs", "ext2", "ext3", "ext4", "btrfs")
+
+
+@dataclass
+class ShrinkPlan:
+    part: int                                  # number of the partition that is made smaller
+    fstype: str
+    label: str
+    old_size: int
+    new_size: int
+    shift: int                                 # bytes the partitions behind it move forward
+    new_parts: dict[int, list[int]]            # partition number -> [start, size] on the target
+    min_size: int                              # estimated minimum size of that filesystem
+    tmp_need: int                              # temporary space needed (data in the cut-off part)
+    target_size: int
+
+
+def _item_for_part(items: list[dict], num: int) -> dict | None:
+    return next((i for i in items if i.get("role") == "part" and i.get("part") == num), None)
+
+
+def _used_estimate(it: dict) -> int | None:
+    """Bytes of data in a filesystem-aware item (None for raw copies)."""
+    if it.get("method") == "partclone" or (it.get("method") == "chunks" and it.get("mapped")):
+        return int(it.get("stream_bytes") or 0)
+    return None
+
+
+def _tail_bytes(it: dict, cdir: Path | None, new_size: int, fallback: int) -> int:
+    """Bytes of stored data at or beyond new_size inside the partition (exact for chunked backups)."""
+    if it.get("method") == "chunks" and cdir is not None and it.get("index_file"):
+        try:
+            idx = ChunkIndex(cdir / it["index_file"])
+            return sum(usz for i in range(idx.count)
+                       for (_o, _c, usz, flag, _h) in [idx.entry(i)]
+                       if flag in (F_ZSTD, F_PLAIN, F_ZERO) and (i + 1) * idx.chunk > new_size)
+        except OSError:
+            pass
+    return fallback
+
+
+def shrink_plan(lay: "Layout", items: list[dict], target_size: int, cdir: Path | None = None) -> ShrinkPlan:
+    """How a whole-disk, filesystem-aware backup fits onto a smaller disk. Raises ValueError with
+    the reason when it cannot."""
+    short = lay.needed - target_size
+    if lay.kind != "disk":
+        raise ValueError("Only backups of whole disks with a partition table can be restored onto a "
+                         "smaller disk.")
+    if lay.label not in ("gpt", "dos"):
+        raise ValueError("Unsupported partition table.")
+    if lay.label == "dos" and any(p.method == "skip" or (p.number or 0) >= 5 for p in lay.parts):
+        raise ValueError("MBR disks with extended/logical partitions cannot be restored onto a smaller "
+                         "disk yet.")
+    shift = -(-short // MIB) * MIB                      # round up to whole MiB: keeps alignment
+    best = None
+    for p in lay.parts:
+        it = _item_for_part(items, p.number)
+        if it is None or p.fstype not in SHRINKABLE_FS:
+            continue
+        used = _used_estimate(it)
+        if used is None:
+            continue
+        # estimate only: the filesystem tool checks the real minimum before anything is shrunk
+        margin = max(64 * MIB, min(512 * MIB, used // 10))
+        min_size = -(-int(used * 1.10 + margin) // MIB) * MIB
+        new_size = p.size - shift
+        if new_size < min_size:
+            continue
+        slack = new_size - min_size
+        if best is None or slack > best[0]:
+            best = (slack, p, it, min_size, new_size)
+    if best is None:
+        cand = [p for p in lay.parts if p.fstype in SHRINKABLE_FS]
+        why = ("no partition has enough free space" if cand else
+               "only NTFS, ext2/3/4 and btrfs partitions can be made smaller, and there is none")
+        raise ValueError(f"The target is {human(short)} smaller than the original disk, and {why}.")
+    _slack, bp, bit, min_size, new_size = best
+    new_parts = {}
+    for p in lay.parts:
+        if p.start > bp.start:
+            new_parts[p.number] = [p.start - shift, p.size]
+        elif p.number == bp.number:
+            new_parts[p.number] = [p.start, new_size]
+        else:
+            new_parts[p.number] = [p.start, p.size]
+    tail = _tail_bytes(bit, cdir, new_size, min(shift, _used_estimate(bit) or shift))
+    return ShrinkPlan(part=bp.number, fstype=bp.fstype, label=bp.label, old_size=bp.size, new_size=new_size,
+                      shift=shift, new_parts=new_parts, min_size=min_size,
+                      tmp_need=tail + 64 * MIB, target_size=target_size)
+
+
+def shrink_lines(sp: ShrinkPlan) -> list[str]:
+    name = f"partition {sp.part} ({sp.fstype}" + (f" '{sp.label}'" if sp.label else "") + ")"
+    lines = [f"[b $warning]The target disk is smaller than the original disk.[/] {escape(name)} is made smaller: "
+             f"{human(sp.old_size)} -> {human(sp.new_size)} (its data needs about {human(sp.min_size)}).",
+             f"Partitions behind it move {human(sp.shift)} forward. Temporary space needed: up to "
+             f"{human(sp.tmp_need)} next to the backup."]
+    if sp.fstype == "ntfs":
+        lines.append("[dim]Windows checks this partition once (chkdsk) at its next start; that is normal "
+                     "after resizing.[/]")
+    return lines
+
+
+def adjust_sfdisk_dump(dump: str, new_parts: dict[int, list[int]], ss: int) -> str:
+    """sfdisk -d output with new start/size for the given partitions (and without the fields that
+    describe the old disk, so that sfdisk fits the table to the target)."""
+    out = []
+    for line in dump.splitlines():
+        if line.startswith(("last-lba:", "device:")):
+            continue
+        m = re.match(r"^(\S+?)(\d+)\s*:\s*(.*)$", line)
+        if m and int(m.group(2)) in new_parts:
+            start, size = new_parts[int(m.group(2))]
+            fields = re.sub(r"start=\s*\d+", f"start={start // ss}", m.group(3))
+            fields = re.sub(r"size=\s*\d+", f"size={size // ss}", fields)
+            line = f"{m.group(1)}{m.group(2)} : {fields}"
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def shrink_tmp_dir(cdir: Path, need: int) -> Path:
+    """Where the cut-off part may be kept during the restore: next to the backup, or diskimg's own
+    folder. Never in RAM."""
+    cands = [cdir.parent, STATE_DIR / "shrink-tmp"]
+    for c in cands:
+        base = existing_ancestor(c)
+        try:
+            free = shutil.disk_usage(base).free
+        except OSError:
+            continue
+        if fstype_of(base) not in NO_CACHE_FS and free >= need + 256 * MIB:
+            return c
+    raise ValueError(f"Restoring onto the smaller disk needs up to {human(need)} of temporary space on a "
+                     f"real disk (next to the backup, {cdir.parent}), but there is not enough.")
+
+
+def ntfs_min_size(dev: str) -> int | None:
+    r = run(["ntfsresize", "-f", "-i", "-P", dev], timeout=600)
+    m = re.search(r"You might resize at (\d+) bytes", r.stdout or "")
+    return int(m.group(1)) if m else None
+
+
+def shrink_filesystem(fstype: str, dev: str, new_size: int, log) -> None:
+    """Shrink the filesystem on dev to at most new_size bytes. Raises ValueError."""
+    if fstype == "ntfs":
+        if not shutil.which("ntfsresize"):
+            raise ValueError("ntfsresize is missing (pacman -S ntfsprogs).")
+        mn = ntfs_min_size(dev)
+        if mn is not None and mn > new_size:
+            raise ValueError(f"The NTFS filesystem cannot be made smaller than {human(mn)}.")
+        r = run(["ntfsresize", "-f", "-P", "-s", str(new_size), dev], timeout=None)
+        if r.returncode != 0:
+            raise ValueError("ntfsresize failed: " + " | ".join((r.stdout + r.stderr).strip().splitlines()[-3:]))
+        log(f"NTFS made smaller to {human(new_size)}.")
+    elif fstype in ("ext2", "ext3", "ext4"):
+        r = run(["e2fsck", "-f", "-y", dev], timeout=None)
+        if r.returncode not in (0, 1):
+            raise ValueError("e2fsck failed: " + " | ".join((r.stdout + r.stderr).strip().splitlines()[-3:]))
+        r = run(["resize2fs", dev, f"{new_size // 1024}K"], timeout=None)
+        if r.returncode != 0:
+            raise ValueError("resize2fs failed: " + " | ".join((r.stdout + r.stderr).strip().splitlines()[-3:]))
+        log(f"{fstype} made smaller to {human(new_size)}.")
+    elif fstype == "btrfs":
+        mp = tempfile.mkdtemp(prefix="diskimg-btrfs-", dir="/run")
+        try:
+            r = run(["mount", "-t", "btrfs", dev, mp], timeout=300)
+            if r.returncode != 0:
+                raise ValueError("btrfs could not be mounted: " + (r.stderr or r.stdout).strip())
+            try:
+                r = run(["btrfs", "filesystem", "resize", str(new_size), mp], timeout=None)
+                if r.returncode != 0:
+                    raise ValueError("btrfs resize failed: " + (r.stderr or r.stdout).strip())
+            finally:
+                run(["umount", mp], timeout=300)
+        finally:
+            try:
+                os.rmdir(mp)
+            except OSError:
+                pass
+        log(f"btrfs made smaller to {human(new_size)}.")
+    else:
+        raise ValueError(f"{fstype} cannot be made smaller.")
+
+
+def check_filesystem(fstype: str, dev: str) -> str | None:
+    """Read-only consistency check after shrinking. Returns a problem description or None."""
+    if fstype == "ntfs":
+        r = run(["ntfsresize", "-f", "-i", "-P", dev], timeout=600)
+        ok = r.returncode == 0
+    elif fstype in ("ext2", "ext3", "ext4"):
+        r = run(["e2fsck", "-f", "-n", dev], timeout=None)
+        ok = r.returncode == 0
+    elif fstype == "btrfs":
+        r = run(["btrfs", "check", "--readonly", dev], timeout=None)
+        ok = r.returncode == 0
+    else:
+        return None
+    return None if ok else " | ".join((r.stdout + r.stderr).strip().splitlines()[-3:])
+
+
+def patch_ntfs_start(dev: str, start_sectors: int) -> None:
+    """Moved NTFS partition: update the 'hidden sectors' field (partition start) in both boot sectors."""
+    fd = os.open(dev, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        bs = os.pread(fd, 512, 0)
+        if bs[3:11] != b"NTFS    ":
+            return
+        val = struct.pack("<I", start_sectors & 0xFFFFFFFF)
+        pwrite_all(fd, val, 0x1C)
+        loc = ntfs_backup_bootsector(dev, os.lseek(fd, 0, os.SEEK_END))
+        if loc:
+            pwrite_all(fd, val, loc[0] + 0x1C)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class BatchRunner:
     """Runs several jobs one after the other (several sources backed up at once). Offers the same
     interface as JobRunner, delegating to the job that is currently running."""
@@ -5377,6 +5746,7 @@ def plan_job(pi: PlanInput, devs: dict[str, Dev]) -> Job:
                    src_label=src_label, dst_label=cache or "-", src_dev=None, dst_dev=None,
                    manifest=man, browse_ids=sorted(sel), keep_cache=pi.keep_cache)
 
+    shrink = None
     if m in ("d2d", "i2d"):
         if not pi.dst_dev or pi.dst_dev not in devs:
             raise ValueError("Select a target device.")
@@ -5392,11 +5762,19 @@ def plan_job(pi: PlanInput, devs: dict[str, Dev]) -> Job:
             if lay["kind"] == "disk" and dst_dev.kind == "part":
                 raise ValueError("This backup contains a whole disk with a partition table. "
                                  "Select a whole disk as target.")
-        if method == "raw" and dst_dev.size < size:
+        shrink = None
+        if man is not None and dst_dev.size < size:
+            if method != "fs":
+                raise ValueError(f"Target too small: this is a raw (sector-by-sector) backup of "
+                                 f"{human(size)}; the target has {human(dst_dev.size)}. Only "
+                                 "filesystem-aware backups can be restored onto a smaller disk.")
+            try:
+                shrink = shrink_plan(Layout.from_json(man["layout"]), man.get("items", []), dst_dev.size, p)
+            except ValueError as e:
+                raise ValueError(f"Target too small: needs {human(size)}, has {human(dst_dev.size)}. {e}")
+        elif method == "raw" and dst_dev.size < size:
             raise ValueError(f"Target too small: needs {human(size)} ({size:,} B), "
                              f"has {human(dst_dev.size)} ({dst_dev.size:,} B).")
-        if man is not None and dst_dev.size < size:
-            raise ValueError(f"Target too small: needs {human(size)}, has {human(dst_dev.size)}.")
         dst, dst_label = dst_dev.path, dst_dev.long
         if eng == "ddrescue":
             if m == "d2d":
@@ -5450,6 +5828,7 @@ def plan_job(pi: PlanInput, devs: dict[str, Dev]) -> Job:
         dst, dst_label = str(rp), f"{rp}  (on {fs}, {human(free)} free)"
 
     return Job(
+        shrink=shrink if m == "i2d" else None,
         mode=m, engine=eng, method=method, src=src, dst=dst, size=size,
         src_label=src_label, dst_label=dst_label, src_dev=src_dev, dst_dev=dst_dev,
         mapfile=mapfile,
@@ -5526,6 +5905,8 @@ def plan_summary(j: Job) -> str:
     if j.dst_is_dev and j.method == "raw" and j.dst_size > j.size:
         extra = f"  [dim](target {human(j.dst_size - j.size)} larger)[/]"
     what = human(j.size) if j.method == "raw" else "used data"
+    if j.shrink:
+        extra = f"  [$warning](smaller disk: partition {j.shrink.part} is made smaller)[/]"
     return (f"[b $success]Ready[/]  {escape(Path(j.src).name)} [dim]->[/] {escape(j.dst)}  "
             f"[b]{what}[/]{extra}")
 
@@ -5664,6 +6045,9 @@ def confirm_lines(job: Job) -> list[str]:
         for w in lay.warnings:
             lines.append(f"[$warning]! {escape(w)}[/]")
         lines.append("[dim]Free space inside filesystems and unpartitioned space are not copied.[/]")
+    if j.shrink:
+        lines.append("")
+        lines += shrink_lines(j.shrink)
     if j.mode in ("d2d", "i2d") and j.dst_dev and j.dst_dev.kind != "part":
         lines.append("[dim]The copy has the same disk/partition IDs as the source. Do not run "
                      "Windows with both disks attached.[/]")
