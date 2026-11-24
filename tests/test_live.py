@@ -26,9 +26,13 @@ def check(c, what) -> None:
 class Sink(E.JobSink):
     def __init__(self):
         self.pairs_log: list[tuple[float, dict]] = []
+        self.bars: list[tuple[str, float]] = []
 
     def pairs(self, pairs):
         self.pairs_log.append((time.monotonic(), {k: v for k, v, _a in pairs}))
+
+    def bar(self, which, pct, info=None):
+        self.bars.append((which, pct))
 
 
 def main() -> int:
@@ -82,6 +86,29 @@ def main() -> int:
         bad = E.chunked_verify_target(work / "d.cidx", str(tgt), 0, threading.Event(), lambda *a: vc.append(a))
         check(not bad and vc[-1] == (src.stat().st_size, src.stat().st_size),
               f"target check progress ends at {E.human(vc[-1][0])} of {E.human(vc[-1][1])}")
+
+        # a partition checked before it is made smaller (inside the copy phase) shows its own
+        # 0-100 %, not the copy's total on top (was: "101.2 %" and climbing)
+        size = src.stat().st_size
+        job = E.Job(mode="i2d", method="fs", src=str(work), dst=str(tgt), src_label="s",
+                    dst_label="d", src_dev=None, dst_dev=None, size=size, engine="container")
+        sink = Sink()
+        r = E.JobRunner(job, sink)
+        r.start_phase(2 * size)
+        r.w_done = 2 * size                       # everything copied
+        it = {"id": "p1", "index_file": "d.cidx", "length": size}
+        with r.own_phase(r.item_weight(it)):
+            res, _why = r._verify_chunked_target(it, str(tgt), work)
+        vb = [p for w, p in sink.bars if w == "verify"]
+        check(res is True and vb and max(vb) <= 100.0001 and vb[-1] >= 99.9,
+              f"check before shrinking: {len(vb)} updates, {min(vb):.1f} % .. {max(vb):.1f} %")
+        check((r.w_done, r.w_total) == (2 * size, 2 * size) and r._live is None,
+              "copy phase continues where it was, no stale progress afterwards")
+        # the final check counts a partition checked earlier as done
+        items = [{"id": "p1", "method": "chunks", "role": "part", "length": size, "_verified": (True, "")},
+                 {"id": "p2", "method": "chunks", "role": "part", "length": size, "_verified": (True, "")}]
+        res = r.verify_target(job, None, items, {})
+        check(res == "ok" and r.w_done == r.w_total, f"final check reaches 100 %: {r.w_done}/{r.w_total}")
 
         # the runner keeps sending progress (clock running) while the copy is stuck in a write
         job = E.Job(mode="d2i", method="fs", src=str(src), dst=str(work / "x"), src_label="s",

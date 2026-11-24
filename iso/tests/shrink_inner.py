@@ -134,13 +134,32 @@ def make_source(scenario: str) -> dict:
     return expect
 
 
+class BarSink(E.JobSink):
+    """Highest percentage each progress bar / the "Total" value showed."""
+    def __init__(self):
+        self.top: dict[str, float] = {}
+
+    def bar(self, which, pct, info=None):
+        self.top[which] = max(self.top.get(which, 0.0), pct)
+
+    def pairs(self, pairs):
+        for k, v, _a in pairs:
+            if k == "Total":
+                self.top["Total"] = max(self.top.get("Total", 0.0), float(v.strip().rstrip("%")))
+
+
+LAST_SINK = BarSink()
+
+
 def run_job(pi) -> tuple:
+    global LAST_SINK
     devs = E.load_devices()
     jobs = E.plan_jobs(pi, devs)
     for j in jobs:
         E.prepare_job(j)
         E.apply_resume_choice(j, None)
-    runner = E.make_runner(jobs)
+    LAST_SINK = BarSink()
+    runner = E.make_runner(jobs, LAST_SINK)
     res = runner.run()
     for f in Path("/var/log/diskimg").glob("*.log"):
         shutil.copy(f, f"/mnt/logs/{f.name}")
@@ -160,6 +179,9 @@ def scenario(name: str) -> bool:
     ok &= check(sp is not None, f"restore planned with shrinking: partition {sp.part if sp else '-'} "
                                 f"{E.human(sp.old_size) if sp else ''} -> {E.human(sp.new_size) if sp else ''}")
     ok &= check(style == "$success", f"restore onto the 560 MiB disk: {res}")
+    top = LAST_SINK.top
+    ok &= check(top and max(top.values()) <= 100.05,
+                "progress never above 100 %: " + ", ".join(f"{k} {v:.1f} %" for k, v in sorted(top.items())))
     settle(TGT)
     ok &= check(sh("sfdisk", "--verify", TGT, check_rc=False).returncode == 0, "partition table verifies")
     for n, (t, want) in expect.items():

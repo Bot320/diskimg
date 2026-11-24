@@ -4116,6 +4116,20 @@ class JobRunner:
         self.w_done = 0
         self.phase_t0 = time.monotonic()
 
+    @contextmanager
+    def own_phase(self, weights: int):
+        """A step with its own 0-100 % inside another phase (the check of a partition before it is
+        made smaller, during the copy): afterwards the outer phase continues where it was, and its
+        clock does not count the time spent here."""
+        saved, t = (self.w_total, self.w_done, self.phase_t0), time.monotonic()
+        self.start_phase(weights)
+        try:
+            yield
+        finally:
+            self.set_live(None)
+            self.w_total, self.w_done, self.phase_t0 = saved
+            self.phase_t0 += time.monotonic() - t
+
     def check_stop(self) -> None:
         if self.stop_requested:
             raise JobFailed("stopped by user")
@@ -4826,7 +4840,8 @@ class JobRunner:
                     if j.verify:
                         self.item_row(it["id"], {"Verify": "checking"})
                         drop_cache(dm)
-                        res, why = self._verify_item(j, lay, it, {sp.part: dm}, target)
+                        with self.own_phase(self.item_weight(it)):
+                            res, why = self._verify_item(j, lay, it, {sp.part: dm}, target)
                         if res is False:
                             it["_verified"] = (False, why)
                             raise JobFailed(f"{it['id']}: the restored data differs from the backup ({why}).")
@@ -4917,6 +4932,7 @@ class JobRunner:
             self.item_row(it["id"], {"Verify": "checking"})
             if "_verified" in it:                 # checked before it was made smaller
                 res, why = it["_verified"]
+                self.w_done += self.item_weight(it)
             else:
                 res, why = self._verify_item(j, lay, it, nodes, target)
             if res == "skipped":
@@ -5074,6 +5090,8 @@ class JobRunner:
         except OSError as e:
             self.log(f"[$error]{it['id']}: {escape(str(e))}[/]")
             return False, "other"
+        finally:
+            self.set_live(None)
         self.w_done += w
         it.update(st)
         if st["bad_bytes"]:
@@ -5103,7 +5121,10 @@ class JobRunner:
                 probs.append("index checksum mismatch")
             return probs
         ev = CondFlag(lambda: self.skip_verify.is_set() or self.stop_requested)
-        probs = chunked_verify_files(data, index, it, ev, self.chunk_progress(it["id"], w, "verify"))
+        try:
+            probs = chunked_verify_files(data, index, it, ev, self.chunk_progress(it["id"], w, "verify"))
+        finally:
+            self.set_live(None)
         self.w_done += w
         if ev.is_set():
             raise InterruptedError("cancelled")
@@ -5126,6 +5147,8 @@ class JobRunner:
         except OSError as e:
             self.log(f"[$error]{it['id']}: write error: {escape(str(e))}[/]")
             return False
+        finally:
+            self.set_live(None)
         self.w_done += w
         note = f", {human(it['bad_bytes'])} zeros" if it.get("bad_bytes") else ""
         self.item_row(it["id"], {"Copy": f"ok {human(it.get('stream_bytes') or 0)}{note}"})
@@ -5141,6 +5164,8 @@ class JobRunner:
             return "skipped", ""
         except OSError as e:
             return False, f"read error: {e}"
+        finally:
+            self.set_live(None)
         self.w_done += w
         return (not bad), f"{len(bad)} chunk(s) differ (first: {bad[:3]})"
 
