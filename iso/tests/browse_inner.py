@@ -166,7 +166,7 @@ def leftovers() -> list[str]:
     for ln in Path("/proc/mounts").read_text().splitlines():
         src, mp = ln.split()[:2]
         if "diskimg-view" in src or "/run/diskimg/stage" in mp or "diskimg-browse" in mp \
-                or "diskimg-files" in mp or src.startswith("/dev/loop"):
+                or "diskimg-files" in mp or (src.startswith("/dev/loop") and "archiso" not in mp):
             out.append(f"{src} {mp}")
     if any(Path("/run/diskimg").glob("stage-*")):
         out.append("stage folders left in /run/diskimg")
@@ -176,7 +176,7 @@ def leftovers() -> list[str]:
 def check_view(mp: Path, want: dict, private: bool, tag: str, links: bool = True) -> bool:
     ok = True
     if not links:
-        out = Path(pwd.getpwnam(USER).pw_dir) / f"copy-{tag}-pf"
+        out = Path(pwd.getpwnam(USER).pw_dir) / f"copy-{tag.replace('/', '-')}-pf"
         shutil.rmtree(out, ignore_errors=True)
         r = as_user(USER, "cp", "-r", str(mp / "Program Files"), str(out))
         got = {f"Program Files/{k}": v for k, v in tree_sums(out).items()} if out.exists() else {}
@@ -186,7 +186,7 @@ def check_view(mp: Path, want: dict, private: bool, tag: str, links: bool = True
         shutil.rmtree(out, ignore_errors=True)
         m = os.stat(mp / "root" / "rootonly.txt").st_mode & 0o777
         ok &= check(m == 0o644, f"{tag}: files appear as rw-r--r-- (not executable): {oct(m)}")
-    out = Path(pwd.getpwnam(USER).pw_dir) / f"copy-{tag}"
+    out = Path(pwd.getpwnam(USER).pw_dir) / f"copy-{tag.replace('/', '-')}"
     shutil.rmtree(out, ignore_errors=True)
     r = as_user(USER, "cp", "-r", "--no-preserve=all", str(mp / "home"), str(out))
     ok &= check(r.returncode == 0, f"{tag}: {USER} copies the whole home folder (cp -r) {r.stderr.strip()[:200]}")
@@ -220,9 +220,11 @@ def disk_backup() -> bool:
     expect = make_source()
     ok = True
     for method in ("fs", "raw"):
-        bk = f"/mnt/browse-{method}.dimg"
-        shutil.rmtree(bk, ignore_errors=True)
-        _r, (res, style) = run_job(E.PlanInput(mode="d2i", method=method, src_dev=SRC, dst_path=bk))
+        pi = E.PlanInput(mode="d2i", method=method, src_dev=SRC)
+        bk = f"/mnt/browse-{method}{E.wanted_ext(pi)}"
+        remove(bk)
+        pi.dst_path = bk
+        _r, (res, style) = run_job(pi)
         ok &= check(style == "$success", f"{method} backup: {res}")
         ids = [r["id"] for r in E.browse_rows_for(bk) if r["ok"]]
         runner, (res, style) = run_job(E.PlanInput(mode="brw", src_path=bk, browse_ids=ids))
@@ -249,7 +251,7 @@ def disk_backup() -> bool:
                 ok &= check(drv == "ntfs3", f"{method}/ntfs: opened with the kernel driver ntfs3 "
                                            f"(reads CompactOS files): {drv}")
         # a program still using the backup: closing must refuse, then detach on request
-        busy = subprocess.Popen(["runuser", "-u", USER, "--", "sleep", "30"], cwd=str(mounts["ext4"]))
+        busy = subprocess.Popen(["sleep", "30"], cwd=str(mounts["ext4"]), user=USER)
         time.sleep(1)
         errs = E.close_browse(sess, force=False)
         ok &= check(bool(errs), f"{method}: close refused while a program uses the backup")
@@ -261,8 +263,17 @@ def disk_backup() -> bool:
         time.sleep(2)
         lo = leftovers()
         ok &= check(not lo, f"{method}: nothing left mounted {lo}")
-        shutil.rmtree(bk, ignore_errors=True)
+        remove(bk)
     return ok
+
+
+def remove(p: str) -> None:
+    for suffix in ("", ".map", ".sha256", ".map.bak"):
+        q = Path(p + suffix)
+        if q.is_dir():
+            shutil.rmtree(q, ignore_errors=True)
+        elif q.exists():
+            q.unlink()
 
 
 def restic_backup() -> bool:

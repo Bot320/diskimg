@@ -149,7 +149,9 @@ def done(d, res):
 def act(a):
     w = Gtk.ApplicationWindow(application=a, title="Dialogtest")
     w.present()
-    Gtk.FileDialog(title="Backup-Ordner waehlen").select_folder(w, None, done)
+    # like a click in a program that is already open: the window is shown before the dialog
+    GLib.timeout_add_seconds(3, lambda: Gtk.FileDialog(title="Backup-Ordner waehlen")
+                             .select_folder(w, None, done) and False)
 app.connect("activate", act)
 app.hold()
 app.run([])
@@ -181,8 +183,10 @@ def chooser_test(env: dict) -> bool:
                          stdout=f, stderr=subprocess.STDOUT)
         time.sleep(3)
     p = live(env, "env", "G_MESSAGES_DEBUG=all", "python3", "/tmp/dialog.py", bg=True)
-    time.sleep(12)
+    time.sleep(10)
     shot(env, "file-chooser")
+    time.sleep(5)
+    shot(env, "file-chooser-later")
     for name, f in logs.items():
         f.flush()
         txt = Path(f"/mnt/logs/{name}.log").read_text(errors="replace")
