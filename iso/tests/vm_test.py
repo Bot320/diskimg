@@ -53,6 +53,7 @@ def run_test(iso: Path, test: str, work: Path) -> int:
     (work / "wd").mkdir(parents=True)
     shutil.copytree(REPO / "diskimg", work / "wd" / "app" / "diskimg",
                     ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(REPO / "libexec", work / "wd" / "app" / "libexec")
     shutil.copy(HERE / inner, work / "wd" / "inner.py")
     (work / "wd" / "run.sh").write_text("python3 -I /mnt/inner.py > /mnt/inner.out 2>&1\nsync\npoweroff\n")
     disks = {"work.img": 2048, **extra}

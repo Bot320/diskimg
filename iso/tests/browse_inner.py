@@ -306,8 +306,8 @@ def restic_backup() -> bool:
 
 def main() -> int:
     os.makedirs("/mnt/logs", exist_ok=True)
-    for u, uid in ((USER, 1000), (OTHER, 1500)):
-        sh("useradd", "-m", "-u", str(uid), u, check_rc=False)
+    for u, uid in ((USER, 1100), (OTHER, 1500)):          # 1000 = the live user
+        sh("useradd", "-m", "-u", str(uid), u)
     os.environ["SUDO_USER"] = USER          # diskimg started by this desktop user
     for d in (E.STATE_DIR, E.MAP_DIR, E.LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)

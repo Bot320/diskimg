@@ -7,6 +7,9 @@
 #   boot option rescue.text=1 = text menu only
 set -u
 export XDG_CURRENT_DESKTOP=rescue
+# a Wayland session (logind says "tty": it was started from the console login); without this the
+# GNOME portal and Nautilus offer no file chooser ("Non-compatible display server")
+export XDG_SESSION_TYPE=wayland
 # file dialogs go through xdg-desktop-portal: GNOME's (Nautilus) file chooser, see
 # /etc/xdg/xdg-desktop-portal/rescue-portals.conf
 export NO_AT_BRIDGE=1

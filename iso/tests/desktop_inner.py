@@ -62,7 +62,7 @@ def session_env() -> dict:
 
 def live(env: dict, *a, bg=False, timeout=60):
     keep = {k: env[k] for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
-                                "XDG_CURRENT_DESKTOP", "XKB_DEFAULT_LAYOUT", "HOME", "PATH")
+                                "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XKB_DEFAULT_LAYOUT", "HOME", "PATH")
             if k in env}
     cmd = ["runuser", "-u", "live", "--", "env"] + [f"{k}={v}" for k, v in keep.items()] + list(a)
     if bg:
@@ -112,9 +112,6 @@ def nas_test(env: dict) -> bool:
     fm = live(env, "nautilus", "--new-window", "computer:///", bg=True)
     time.sleep(8)
     shot(env, "nautilus-this-pc")
-    live(env, "nautilus", "--new-window", "other-locations:///", bg=True)
-    time.sleep(6)
-    shot(env, "nautilus-other-locations")
     sh("pkill", "-u", "live", "-f", "nautilus", check_rc=False)
     fm.wait(timeout=30)
     # a backup target on the share is marked as NAS when the job is planned
@@ -164,12 +161,34 @@ def chooser_test(env: dict) -> bool:
              "--object-path", "/org/freedesktop/portal/desktop", "--method",
              "org.freedesktop.DBus.Properties.Get", "org.freedesktop.portal.FileChooser", "version",
              timeout=60)
-    ok = check(r.returncode == 0, f"file chooser portal answers: {(r.stdout or r.stderr).strip()[:200]}")
+    ok = check(env.get("XDG_SESSION_TYPE") == "wayland",
+               f"session type is wayland: {env.get('XDG_SESSION_TYPE')}")
+    ok &= check(r.returncode == 0, f"file chooser portal answers: {(r.stdout or r.stderr).strip()[:200]}")
     Path("/tmp/dialog.py").write_text(DIALOG)
     os.chmod("/tmp/dialog.py", 0o644)
-    p = live(env, "python3", "/tmp/dialog.py", bg=True)
+    # verbose logs of the portal chain: xdg-desktop-portal -> xdg-desktop-portal-gnome -> Nautilus
+    sh("pkill", "-u", "live", "-f", "nautilus", check_rc=False)
+    logs = {}
+    for name, cmd in (("xdp", ["/usr/lib/xdg-desktop-portal", "--replace", "--verbose"]),
+                      ("xdpg", ["/usr/lib/xdg-desktop-portal-gnome", "--replace", "--verbose"]),
+                      ("nautilus", ["nautilus", "--gapplication-service"])):
+        f = open(f"/mnt/logs/{name}.log", "w")
+        logs[name] = f
+        keep = {k: env[k] for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                                    "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "HOME", "PATH") if k in env}
+        subprocess.Popen(["runuser", "-u", "live", "--", "env", "G_MESSAGES_DEBUG=all"]
+                         + [f"{k}={v}" for k, v in keep.items()] + cmd,
+                         stdout=f, stderr=subprocess.STDOUT)
+        time.sleep(3)
+    p = live(env, "env", "G_MESSAGES_DEBUG=all", "python3", "/tmp/dialog.py", bg=True)
     time.sleep(12)
     shot(env, "file-chooser")
+    for name, f in logs.items():
+        f.flush()
+        txt = Path(f"/mnt/logs/{name}.log").read_text(errors="replace")
+        bad = [ln for ln in txt.splitlines()
+               if any(w in ln.lower() for w in ("fail", "error", "critical", "warning", "cannot", "not "))]
+        say(f"      {name}.log ({len(txt.splitlines())} lines): " + " || ".join(bad[-6:])[:900])
     procs = sh("ps", "-eo", "user,args", check_rc=False).stdout
     gnome = [ln for ln in procs.splitlines() if "xdg-desktop-portal-gnome" in ln]
     naut = [ln for ln in procs.splitlines() if "nautilus" in ln and "live" in ln]
@@ -182,7 +201,11 @@ def chooser_test(env: dict) -> bool:
     except subprocess.TimeoutExpired:
         p.kill()
         out = ""
-    say("      dialog program output: " + " ".join(out.split())[:300])
+    Path("/mnt/logs/dialog.log").write_text(out or "")
+    ok &= check("Dismissed" not in (out or "") and "ERROR" not in (out or ""),
+                "the dialog was still open when it was closed by the test")
+    say("      dialog program output: " + " ".join(
+        ln for ln in (out or "").splitlines() if "CHOSEN" in ln or "ERROR" in ln or "portal" in ln.lower())[:600])
     return ok
 
 

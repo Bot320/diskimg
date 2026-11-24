@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Arch package of diskimg built from this source tree:  cd packaging && makepkg -si
 pkgname=diskimg
-pkgver=4.0.0
+pkgver=4.1.0
 pkgrel=1
 pkgdesc="Disk imaging for Arch Linux: GTK 4 app with text-interface fallback (ddrescue, partclone, zstd, gpg, SMB/NFS, restic)"
 arch=('any')
