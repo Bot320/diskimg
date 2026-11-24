@@ -3436,6 +3436,7 @@ class JobRunner:
         self.stop_requested = False
         self.quit_after = False          # stop requested because the program is quitting
         self.skip_verify = threading.Event()
+        self.skip_ok = False            # a check outside the verify steps can be skipped right now
         self.steps = {k: "pending" for k, _ in job_steps(job)}
         self.step_names = dict(job_steps(job))
         if not job.verify and "verify" in self.steps and job.engine != "check":
@@ -3541,7 +3542,7 @@ class JobRunner:
         self.request_stop()
 
     def request_skip(self) -> bool:
-        if self.steps.get("verify") == "run" or self.steps.get("precheck") == "run":
+        if self.steps.get("verify") == "run" or self.steps.get("precheck") == "run" or self.skip_ok:
             self.skip_verify.set()
             if self.cur:
                 self.cur.abort()
@@ -4840,13 +4841,24 @@ class JobRunner:
                     if j.verify:
                         self.item_row(it["id"], {"Verify": "checking"})
                         drop_cache(dm)
-                        with self.own_phase(self.item_weight(it)):
-                            res, why = self._verify_item(j, lay, it, {sp.part: dm}, target)
+                        self.skip_ok = True               # "Skip check" skips this check only
+                        self.sink.button("skip", True)
+                        try:
+                            with self.own_phase(self.item_weight(it)):
+                                res, why = self._verify_item(j, lay, it, {sp.part: dm}, target)
+                        finally:
+                            self.skip_ok = False
+                            self.sink.button("skip", False)
+                        self.check_stop()                 # Stop stops (it is not a skip)
                         if res is False:
                             it["_verified"] = (False, why)
                             raise JobFailed(f"{it['id']}: the restored data differs from the backup ({why}).")
                         it["_verified"] = (True, "") if res is True else ("skipped", "")
                         self.item_row(it["id"], {"Verify": "ok" if res is True else "skipped"})
+                        if res is not True:
+                            self.log(f"[$warning]{it['id']}: check before making it smaller skipped; "
+                                     f"this partition will not be verified.[/]")
+                            self.skip_verify.clear()      # the other partitions are still checked
                     self.item_row(it["id"], {"Copy": "making smaller"})
                     try:
                         shrink_filesystem(sp.fstype, dm, sp.new_size, self.log)
@@ -4924,25 +4936,34 @@ class JobRunner:
         todo = [i for i in items if i["method"] not in ("skip",) and i["role"] != "dropped"]
         self.start_phase(sum(self.item_weight(i) for i in todo))
         bad = 0
+        unchecked = []
         for it in todo:
             if self.skip_verify.is_set():
                 self.log("[$warning]Verification skipped by user.[/]")
-                return "skipped"
+                return "mismatch" if bad else "skipped"
             self.check_stop()
-            self.item_row(it["id"], {"Verify": "checking"})
-            if "_verified" in it:                 # checked before it was made smaller
+            if "_verified" in it:                 # checked (or skipped) before it was made smaller
                 res, why = it["_verified"]
                 self.w_done += self.item_weight(it)
+                if res == "skipped":
+                    unchecked.append(it["id"])
+                    self.item_row(it["id"], {"Verify": "skipped"})
+                    continue
             else:
+                self.item_row(it["id"], {"Verify": "checking"})
                 res, why = self._verify_item(j, lay, it, nodes, target)
             if res == "skipped":
-                return "skipped"
+                return "mismatch" if bad else "skipped"
             self.item_row(it["id"], {"Verify": "ok" if res else "BAD"})
             if not res:
                 bad += 1
                 self.log(f"[b $error]{it['id']}: {escape(why)}[/]")
         if bad:
             return "mismatch"
+        if unchecked:
+            self.log(f"[$warning]Everything else was read back and matches; not checked: "
+                     f"{', '.join(unchecked)}.[/]")
+            return "skipped"
         self.log("[b $success]Verification passed: everything written to the target was read back "
                   "and matches " + ("the source" if j.mode == "d2d" else "the image") + ".[/]")
         return "ok"

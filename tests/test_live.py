@@ -109,6 +109,12 @@ def main() -> int:
                  {"id": "p2", "method": "chunks", "role": "part", "length": size, "_verified": (True, "")}]
         res = r.verify_target(job, None, items, {})
         check(res == "ok" and r.w_done == r.w_total, f"final check reaches 100 %: {r.w_done}/{r.w_total}")
+        # a skipped check before shrinking: the rest is still checked, the result is "not verified",
+        # and a difference found elsewhere is never hidden by the skip
+        items[0]["_verified"] = ("skipped", "")
+        check(r.verify_target(job, None, items, {}) == "skipped", "skipped check before shrinking -> not verified")
+        items[1]["_verified"] = (False, "differs")
+        check(r.verify_target(job, None, items, {}) == "mismatch", "a difference still fails the check")
 
         # the runner keeps sending progress (clock running) while the copy is stuck in a write
         job = E.Job(mode="d2i", method="fs", src=str(src), dst=str(work / "x"), src_label="s",

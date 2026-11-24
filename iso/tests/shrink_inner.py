@@ -135,12 +135,25 @@ def make_source(scenario: str) -> dict:
 
 
 class BarSink(E.JobSink):
-    """Highest percentage each progress bar / the "Total" value showed."""
-    def __init__(self):
+    """Highest percentage each progress bar / the "Total" value showed. With press="skip"/"stop",
+    presses that button as soon as the check before shrinking is running."""
+    def __init__(self, press: str | None = None):
         self.top: dict[str, float] = {}
+        self.press, self.pressed, self.runner, self.logs = press, None, None, []
+        self.buttons: dict[str, bool] = {}
+
+    def log(self, markup):
+        self.logs.append(markup)
+
+    def button(self, name, enabled):
+        self.buttons[name] = enabled
 
     def bar(self, which, pct, info=None):
         self.top[which] = max(self.top.get(which, 0.0), pct)
+        r = self.runner
+        if self.press and self.pressed is None and which == "verify" and r and r.steps.get("copy") == "run":
+            self.pressed = (r.request_skip() if self.press == "skip" else (r.request_stop() or True),
+                            self.buttons.get("skip"))
 
     def pairs(self, pairs):
         for k, v, _a in pairs:
@@ -151,34 +164,50 @@ class BarSink(E.JobSink):
 LAST_SINK = BarSink()
 
 
-def run_job(pi) -> tuple:
+def run_job(pi, press: str | None = None) -> tuple:
     global LAST_SINK
     devs = E.load_devices()
     jobs = E.plan_jobs(pi, devs)
     for j in jobs:
         E.prepare_job(j)
         E.apply_resume_choice(j, None)
-    LAST_SINK = BarSink()
+    LAST_SINK = BarSink(press)
     runner = E.make_runner(jobs, LAST_SINK)
+    LAST_SINK.runner = runner
     res = runner.run()
     for f in Path("/var/log/diskimg").glob("*.log"):
         shutil.copy(f, f"/mnt/logs/{f.name}")
     return jobs, res
 
 
-def scenario(name: str) -> bool:
-    say(f"=== scenario {name}: shrink the {name} partition ===")
+def scenario(name: str, press: str | None = None) -> bool:
+    say(f"=== scenario {name}: shrink the {name} partition"
+        + (f", press {press} during the check before shrinking" if press else "") + " ===")
     expect = make_source(name)
     bk = f"/mnt/backup-{name}.dimg"
     shutil.rmtree(bk, ignore_errors=True)
     _jobs, (res, style) = run_job(E.PlanInput(mode="d2i", method="fs", src_dev=SRC, dst_path=bk))
     ok = check(style == "$success", f"backup: {res}")
     sh("wipefs", "-a", TGT, check_rc=False)
-    jobs, (res, style) = run_job(E.PlanInput(mode="i2d", src_path=bk, dst_dev=TGT))
+    jobs, (res, style) = run_job(E.PlanInput(mode="i2d", src_path=bk, dst_dev=TGT), press)
     sp = jobs[0].shrink
     ok &= check(sp is not None, f"restore planned with shrinking: partition {sp.part if sp else '-'} "
                                 f"{E.human(sp.old_size) if sp else ''} -> {E.human(sp.new_size) if sp else ''}")
-    ok &= check(style == "$success", f"restore onto the 560 MiB disk: {res}")
+    logtxt = "\n".join(LAST_SINK.logs)
+    if press:
+        ok &= check(LAST_SINK.pressed is not None and LAST_SINK.pressed[0] and LAST_SINK.pressed[1],
+                    f"{press} button enabled and accepted during the check before shrinking: {LAST_SINK.pressed}")
+    if press == "stop":
+        ok &= check(res == "STOPPED", f"Stop stops the restore: {res}")
+        ok &= check("made smaller to" not in logtxt, "nothing was made smaller after Stop")
+        shutil.rmtree(bk, ignore_errors=True)
+        return ok
+    if press == "skip":
+        ok &= check(res.startswith("DONE - not verified"), f"result says not verified: {res}")
+        ok &= check("not checked:" in logtxt, "the other partitions were still checked")
+        ok &= check("made smaller to" in logtxt, "partition made smaller after the skipped check")
+    else:
+        ok &= check(style == "$success", f"restore onto the 560 MiB disk: {res}")
     top = LAST_SINK.top
     ok &= check(top and max(top.values()) <= 100.05,
                 "progress never above 100 %: " + ", ".join(f"{k} {v:.1f} %" for k, v in sorted(top.items())))
@@ -210,11 +239,11 @@ def main() -> int:
     E.MAP_DIR.mkdir(parents=True, exist_ok=True)
     E.LOG_DIR.mkdir(parents=True, exist_ok=True)
     ok = True
-    for name in ("ntfs", "ext4"):
+    for name, press in (("ntfs", None), ("ext4", None), ("ntfs", "skip"), ("ntfs", "stop")):
         try:
-            ok &= scenario(name)
+            ok &= scenario(name, press)
         except Exception as e:  # noqa: BLE001
-            ok = check(False, f"scenario {name}: {type(e).__name__}: {e}")
+            ok = check(False, f"scenario {name} {press or ''}: {type(e).__name__}: {e}")
     say("SHRINK VM TEST " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
 
