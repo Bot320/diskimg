@@ -89,6 +89,7 @@ from .engine import (  # noqa: E501
     find_mounted,
     fs_usage,
     fstype_of,
+    location_text,
     human,
     is_container,
     is_net_url,
@@ -846,7 +847,7 @@ class FileBackupScreen(Screen):
                 yield Input(placeholder="e.g. Documents", id="fb-name")
                 yield Label("Repository folder (local disk or NAS share; created if missing)",
                             classes="opt-label")
-                yield Input(placeholder="/mnt/diskimg-net/nas_backups/files", id="fb-repo")
+                yield Input(placeholder="/media/NAS nas backups/files", id="fb-repo")
                 with Horizontal(classes="fb-row"):
                     yield Select(places_options(), value="/", allow_blank=False, id="fb-places")
                     yield Button("Network", id="fb-net")
@@ -1626,7 +1627,7 @@ class MainScreen(Screen):
         try:
             base = existing_ancestor(Path(raw or "/"))
             free = shutil.disk_usage(base).free
-            info.update(f"needs about {human(need)}   free there: {human(free)} ({fstype_of(base)})")
+            info.update(f"needs about {human(need)}   free there: {human(free)} ({location_text(base)})")
         except OSError:
             info.update("")
 
@@ -1778,7 +1779,7 @@ class MainScreen(Screen):
             p = Path(raw)
             if raw and p.parent.is_dir():
                 free = shutil.disk_usage(p.parent).free
-                info.update(f"filesystem: {fstype_of(p.parent)}   free: {human(free)}"
+                info.update(f"{location_text(p.parent)}   free: {human(free)}"
                             + ("   [yellow]exists[/]" if p.exists() else ""))
             else:
                 info.update("[dim]folder does not exist[/]" if raw else "")

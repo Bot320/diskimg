@@ -195,7 +195,7 @@ class Helper:
         if kind == "dst":
             if p.parent.is_dir():
                 free = shutil.disk_usage(p.parent).free
-                out["text"] = (f"filesystem: {E.fstype_of(p.parent)}   free: {E.human(free)}"
+                out["text"] = (f"{E.location_text(p.parent)}   free: {E.human(free)}"
                                + ("   [yellow]exists[/]" if p.exists() else ""))
             else:
                 out["text"] = "[dim]folder does not exist[/]"
@@ -232,7 +232,7 @@ class Helper:
             return "[dim]nothing needs to be unpacked[/]"
         base = E.existing_ancestor(Path(path or "/"))
         free = shutil.disk_usage(base).free
-        return f"needs about {E.human(need)}   free there: {E.human(free)} ({E.fstype_of(base)})"
+        return f"needs about {E.human(need)}   free there: {E.human(free)} ({E.location_text(base)})"
 
     def cmd_default_name(self, src_dev: str, plan: dict) -> str:
         with self.lock:

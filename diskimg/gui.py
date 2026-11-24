@@ -1394,8 +1394,9 @@ class RunPage(Gtk.Box):
             r = len(self.item_cells) + 1
             self.item_cells[iid] = {}
             for c, name in enumerate(self.COLS):
-                lb = label(cells.get(name, ""), selectable=False, ellipsize=True)
-                lb.set_max_width_chars(34)
+                # full text, never cut off: the table scrolls sideways if the window is too narrow
+                lb = label(cells.get(name, ""))
+                lb.set_tooltip_text(cells.get(name, "") or None)
                 self.items.attach(lb, c, r, 1, 1)
                 self.item_cells[iid][name] = lb
         else:
@@ -1403,6 +1404,7 @@ class RunPage(Gtk.Box):
                 lb = self.item_cells[iid].get(k)
                 if lb is not None:
                     lb.set_text(v)
+                    lb.set_tooltip_text(v or None)
         for k in ("Copy", "Verify"):
             lb = self.item_cells[iid][k]
             t = lb.get_text()
@@ -1427,6 +1429,7 @@ class RunPage(Gtk.Box):
             self.stats.attach(label(k, css=("dim-label",)), c * 2, r, 1, 1)
             lb = label(v, css=("heading",) + (("error",) if alert_ else ()), ellipsize=True)
             lb.set_hexpand(True)
+            lb.set_tooltip_text(v)
             self.stats.attach(lb, c * 2 + 1, r, 1, 1)
 
     def finish(self, result: str, style: str) -> None:

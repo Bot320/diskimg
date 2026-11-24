@@ -17,6 +17,12 @@ def main() -> int:
         from diskimg.engine import serve_chunks, set_c_locale
         set_c_locale()
         return serve_chunks(rest[0], rest[1:]) if rest else 2
+    if cmd == "serve-view":
+        from diskimg.engine import serve_view, set_c_locale
+        set_c_locale()
+        if len(rest) != 4 or not (rest[2].isdigit() and rest[3].isdigit()):
+            return 2
+        return serve_view(rest[0], rest[1], int(rest[2]), int(rest[3]))
     if cmd in ("extract", "--extract"):
         from pathlib import Path
         from diskimg.engine import chunked_extract

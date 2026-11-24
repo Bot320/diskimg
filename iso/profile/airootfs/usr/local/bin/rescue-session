@@ -7,7 +7,8 @@
 #   boot option rescue.text=1 = text menu only
 set -u
 export XDG_CURRENT_DESKTOP=rescue
-export GTK_USE_PORTAL=0
+# file dialogs go through xdg-desktop-portal: GNOME's (Nautilus) file chooser, see
+# /etc/xdg/xdg-desktop-portal/rescue-portals.conf
 export NO_AT_BRIDGE=1
 export WLR_NO_HARDWARE_CURSORS=1
 state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/rescue-kbd"

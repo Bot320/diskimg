@@ -77,6 +77,10 @@ libadwaita
 bootrepair
 # --- graphical kiosk session
 cage
+# GNOME's file chooser (Nautilus) for "Open"/"Save" dialogs instead of GTK's plain one
+xdg-desktop-portal
+xdg-desktop-portal-gnome
+xdg-desktop-portal-gtk
 wlr-randr
 mesa
 foot

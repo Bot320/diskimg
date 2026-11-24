@@ -35,7 +35,7 @@ from pathlib import Path
 from rich.markup import escape
 from rich.text import Text
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 STATE_DIR = Path("/var/lib/diskimg")
 MAP_DIR = STATE_DIR / "maps"
 LOG_DIR = Path("/var/log/diskimg")
@@ -47,7 +47,8 @@ CHUNK = 1 << 20
 MIB = 1 << 20
 CONTAINER_EXT = ".dimg"
 MANIFEST = "manifest.json"
-NET_ROOT = Path("/mnt/diskimg-net")
+NET_ROOT = Path("/media")                   # file managers list mounts here next to the drives
+OLD_NET_ROOT = Path("/mnt/diskimg-net")     # until 4.1: saved repository paths may point here
 BROWSE_ROOT = Path("/mnt/diskimg-browse")
 CONF_DIR = Path("/etc/diskimg")
 SHARES_FILE = CONF_DIR / "shares.json"
@@ -119,6 +120,31 @@ def human(n: int | float | None) -> str:
     return f"{n:.1f} PB"
 
 
+class RateMeter:
+    """Transfer rate over the last few seconds (drops while a write blocks, unlike an average)."""
+
+    def __init__(self, window: float = 5.0):
+        self.window = window
+        self.samples: deque = deque()
+
+    def rate(self, total: int) -> float:
+        now = time.monotonic()
+        self.samples.append((now, total))
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.window:
+            self.samples.popleft()
+        t0, b0 = self.samples[0]
+        return max(0.0, (total - b0) / (now - t0)) if now - t0 >= 0.5 else 0.0
+
+
+def ratio_text(data: int, stored: int) -> str:
+    """'2.4 : 1  (58 % saved)' for data bytes that took stored bytes."""
+    if data <= 0 or stored <= 0:
+        return "-"
+    saved = (1 - stored / data) * 100
+    return f"{data / stored:.1f} : 1  ({saved:.0f} % saved)" if saved >= 0 else \
+        f"none ({-saved:.0f} % larger)"
+
+
 def fmt_dur(s: float | None) -> str:
     if s is None or s < 0 or s > 86400 * 30:
         return "-"
@@ -166,6 +192,28 @@ def fstype_of(path: Path) -> str:
         return r.stdout.strip().splitlines()[0] if r.stdout.strip() else "?"
     except Exception:
         return "?"
+
+
+def net_share_of(path) -> str | None:
+    """'SMB //server/share' / 'NFS server:/export' when path is on a network share, else None."""
+    try:
+        r = run(["findmnt", "-n", "-o", "SOURCE,FSTYPE", "-T", str(path)], timeout=10)
+        src, fst = r.stdout.strip().splitlines()[0].rsplit(None, 1)
+    except Exception:
+        return None
+    if fst in ("cifs", "smb3"):
+        return f"SMB {src.strip()}"
+    if fst.startswith("nfs"):
+        return f"NFS {src.strip()}"
+    return None
+
+
+def location_text(path) -> str:
+    """'filesystem: ext4' or a clearly marked network share (Rich markup)."""
+    net = net_share_of(path)
+    if net:
+        return f"[b $accent]NAS[/] network share {escape(net)}"
+    return f"filesystem: {fstype_of(Path(path))}"
 
 
 def has_gpt(path: str) -> bool:
@@ -941,11 +989,14 @@ def mount_share(conn: dict, password: str) -> str:
     existing = find_mounted(conn)
     if existing:
         return existing
-    base = NET_ROOT / sanitize(f"{conn['server']}_{conn['share']}")
+    # "NAS server share" under /media: Nautilus & co. show it with the drives ("This PC" / Other
+    # Locations), with a network icon and a name that says what it is
+    base = NET_ROOT / f"NAS {sanitize(conn['server'])} {sanitize(conn['share'])}"
     mp, n = base, 2
     while os.path.ismount(mp):
-        mp = Path(f"{base}_{n}")
+        mp = Path(f"{base} {n}")
         n += 1
+    NET_ROOT.mkdir(mode=0o755, exist_ok=True)
     mp.mkdir(parents=True, exist_ok=True)
     cred = None
     if conn["proto"] == "smb":
@@ -986,6 +1037,19 @@ def mount_share(conn: dict, password: str) -> str:
         except OSError:
             pass
         raise ValueError(explain_mount_error((r.stderr or "") + (r.stdout or "")))
+    # saved file backup sets may name the old place (/mnt/diskimg-net/server_share/...)
+    old = OLD_NET_ROOT / sanitize(f"{conn['server']}_{conn['share']}")
+    try:
+        if old.is_dir() and not old.is_symlink() and not os.path.ismount(old):
+            old.rmdir()             # an empty leftover folder (fails harmlessly if not empty)
+        if old.is_symlink() or not old.exists():
+            OLD_NET_ROOT.mkdir(parents=True, exist_ok=True)
+            tmp = old.with_name(old.name + ".new")
+            tmp.unlink(missing_ok=True)
+            tmp.symlink_to(mp)
+            os.replace(tmp, old)
+    except OSError:
+        pass
     return str(mp)
 
 
@@ -1110,28 +1174,35 @@ def open_in_file_manager(path: str) -> str | None:
     return None
 
 
+OWNERLESS_FS = ("ntfs", "vfat", "exfat")     # mount options decide the owner of every file
+
+
 def mount_ro(dev: str, fstype: str, mp: str) -> str | None:
-    """Mount read-only. Returns an error message or None."""
+    """Mount read-only (never device nodes or set-uid programs from a backup). Filesystems without
+    Unix owners belong to the desktop user; the others keep their owners (see start_view).
+    Returns an error message or None."""
     du = desktop_user()
     uid, gid = (du[1], du[2]) if du else (0, 0)
-    own = f"uid={uid},gid={gid},umask=022"
+    own = f"nodev,nosuid,uid={uid},gid={gid},fmask=0133,dmask=0022"
     os.makedirs(mp, exist_ok=True)
     tries: list[list[str]] = []
     if fstype == "ntfs":
+        # the kernel driver first: it reads files Windows compressed with CompactOS / WOF (many
+        # files under Windows and Program Files), which ntfs-3g cannot read without an extra plugin
+        tries.append(["mount", "-t", "ntfs3", "-o", f"ro,force,{own}", dev, mp])
         if shutil.which("ntfs-3g"):
             tries.append(["ntfs-3g", "-o", f"ro,{own}", dev, mp])
-        tries.append(["mount", "-t", "ntfs3", "-o", f"ro,force,{own}", dev, mp])
     elif fstype in ("vfat", "exfat"):
         tries.append(["mount", "-t", fstype, "-o", f"ro,{own}", dev, mp])
     elif fstype in ("ext2", "ext3", "ext4"):
-        tries.append(["mount", "-t", fstype, "-o", "ro,noload", dev, mp])
+        tries.append(["mount", "-t", fstype, "-o", "ro,noload,nodev,nosuid", dev, mp])
     elif fstype == "xfs":
-        tries.append(["mount", "-t", "xfs", "-o", "ro,norecovery", dev, mp])
+        tries.append(["mount", "-t", "xfs", "-o", "ro,norecovery,nodev,nosuid", dev, mp])
     elif fstype == "btrfs":
-        tries.append(["mount", "-t", "btrfs", "-o", "ro,rescue=nologreplay", dev, mp])
-        tries.append(["mount", "-t", "btrfs", "-o", "ro", dev, mp])
+        tries.append(["mount", "-t", "btrfs", "-o", "ro,rescue=nologreplay,nodev,nosuid", dev, mp])
+        tries.append(["mount", "-t", "btrfs", "-o", "ro,nodev,nosuid", dev, mp])
     elif fstype:
-        tries.append(["mount", "-t", fstype, "-o", "ro", dev, mp])
+        tries.append(["mount", "-t", fstype, "-o", "ro,nodev,nosuid", dev, mp])
     else:
         return "no filesystem found"
     errs = []
@@ -1159,6 +1230,8 @@ class BrowseSession:
     procs: list[subprocess.Popen] = field(default_factory=list)
     fuse_mounts: list[str] = field(default_factory=list)
     note: str = ""
+    views: list[subprocess.Popen] = field(default_factory=list)    # serve-view processes (start_view)
+    stages: list[str] = field(default_factory=list)    # root-only mounts behind the views
 
 
 def close_browse(sess: BrowseSession, force: bool = False) -> list[str]:
@@ -1172,6 +1245,26 @@ def close_browse(sess: BrowseSession, force: bool = False) -> list[str]:
             remaining.append((mp, desc))
     sess.mounts = list(reversed(remaining))
     if sess.mounts:
+        return errs
+    # the file views end when their mount is gone (a lazily detached one: when its last user lets go)
+    for p in sess.views:
+        try:
+            p.wait(timeout=5 if force else 15)
+        except subprocess.TimeoutExpired:
+            if not force:
+                p.kill()
+                p.wait()
+        if p.poll() is not None:
+            _unreg(p)
+    sess.views = [p for p in sess.views if p.poll() is None]
+    remaining_s = []
+    for st in reversed(sess.stages):
+        e = umount_path(st, lazy=force or bool(sess.views))
+        if e:
+            errs.append(f"{st}: {e}")
+            remaining_s.append(st)
+    sess.stages = list(reversed(remaining_s))
+    if sess.stages:
         return errs
     for lp in sess.loops:
         run(["losetup", "-d", lp], timeout=30)
@@ -1616,13 +1709,15 @@ def chunked_backup(src: str, regions: list[tuple[int, int]], total: int, level: 
     ri = 0
     last_drop = 0
     stats = {"data": 0, "zero": 0, "absent": 0}
+    packed_in = 0           # used data in the chunks written so far (for the compression ratio)
 
     def compress(b: bytes) -> bytes:
         return ZSTD.compress(b, level)
 
     def flush_one() -> None:
-        nonlocal pos
-        i, usz, fut, flag, h, plain = pending.popleft()
+        nonlocal pos, packed_in
+        i, usz, fut, flag, h, plain, ub = pending.popleft()
+        packed_in += ub
         if flag in (F_ABSENT, F_ZERO):
             entries.extend(IDX_ENT.pack(0, 0, usz, flag, h))
             return
@@ -1661,7 +1756,7 @@ def chunked_backup(src: str, regions: list[tuple[int, int]], total: int, level: 
                         ov.append((s, e))
                     k += 1
                 if not ov:
-                    pending.append((i, usz, None, F_ABSENT, bytes(16), None))
+                    pending.append((i, usz, None, F_ABSENT, bytes(16), None, 0))
                     stats["absent"] += 1
                 else:
                     span_s, span_e = ov[0][0], ov[-1][1]
@@ -1679,14 +1774,15 @@ def chunked_backup(src: str, regions: list[tuple[int, int]], total: int, level: 
                             bad += lost
                             if len(bad_ranges) < 1000:
                                 bad_ranges.append([bo, bl])
-                    done_used += sum(e - s for s, e in ov)
+                    ub = sum(e - s for s, e in ov)
+                    done_used += ub
                     h = chunk_hash(b)
                     if b == ZERO_CHUNK[:usz]:
-                        pending.append((i, usz, None, F_ZERO, h, None))
+                        pending.append((i, usz, None, F_ZERO, h, None, ub))
                         stats["zero"] += 1
                     else:
                         fut = pool.submit(compress, b) if level else None
-                        pending.append((i, usz, fut, F_PLAIN, h, b))
+                        pending.append((i, usz, fut, F_PLAIN, h, b, ub))
                         stats["data"] += 1
                 while len(pending) > 2 * workers:
                     flush_one()
@@ -1699,9 +1795,11 @@ def chunked_backup(src: str, regions: list[tuple[int, int]], total: int, level: 
                     except OSError:
                         pass
                 if progress:
-                    progress(done_used, used_total, bad)
+                    progress(done_used, used_total, bad, pos, packed_in)
             while pending:
                 flush_one()
+            if progress:
+                progress(done_used, used_total, bad, pos, packed_in)
         out.flush()
         os.fsync(out.fileno())
         try:
@@ -1959,6 +2057,237 @@ def serve_chunks(mountpoint: str, specs: list[str]) -> int:
     finally:
         pyfuse3.close(unmount=False)
     return 0
+
+
+def serve_view(src: str, mountpoint: str, uid: int, gid: int, shared: bool = True) -> int:
+    """FUSE server (separate process, root): a read-only view of the directory tree src in which
+    every file and folder belongs to uid:gid and is readable by it (and only by it). Lets the
+    desktop user copy anything out of an opened backup of a Linux filesystem, whose files keep
+    their original owners and permissions. Never follows symlinks and opens only regular files."""
+    try:
+        import pyfuse3  # type: ignore
+        import trio  # type: ignore
+    except ImportError as e:
+        print(f"diskimg: FUSE support missing ({e}). Install python-pyfuse3.", file=sys.stderr)
+        return 2
+    root = os.fsencode(src)
+    paths: dict[int, bytes] = {pyfuse3.ROOT_INODE: root}
+    keys: dict[int, tuple[int, int]] = {}
+    by_key: dict[tuple[int, int], int] = {}
+    nlookup: dict[int, int] = {}
+    dirs: dict[int, list[tuple[bytes, os.stat_result]]] = {}
+    files: dict[int, int] = {}
+    counter = [pyfuse3.ROOT_INODE + 1]
+
+    def err(e: OSError):
+        return pyfuse3.FUSEError(e.errno or errno.EIO)
+
+    def attrs(ino: int, st: os.stat_result):
+        a = pyfuse3.EntryAttributes()
+        a.st_ino = ino
+        a.generation = 0
+        a.entry_timeout = a.attr_timeout = 300
+        m = st.st_mode
+        if stat.S_ISDIR(m):
+            mode = 0o500
+        elif stat.S_ISLNK(m):
+            mode = 0o777
+        elif stat.S_ISREG(m):
+            mode = 0o400 | (0o100 if m & 0o111 else 0)
+        else:       # devices, FIFOs, sockets: listed, never opened (the kernel would handle a FIFO
+            mode = 0    # itself and block; no permission bits make every open fail at once)
+        a.st_mode = stat.S_IFMT(m) | mode
+        a.st_nlink = st.st_nlink
+        a.st_uid, a.st_gid = uid, gid
+        a.st_rdev = 0
+        a.st_size = st.st_size
+        a.st_blksize = 131072
+        a.st_blocks = st.st_blocks
+        a.st_atime_ns, a.st_mtime_ns, a.st_ctime_ns = st.st_atime_ns, st.st_mtime_ns, st.st_ctime_ns
+        return a
+
+    def ino_for(path: bytes, st: os.stat_result) -> int:
+        k = (st.st_dev, st.st_ino)
+        ino = by_key.get(k)
+        if ino is None:
+            ino = counter[0]
+            counter[0] += 1
+            by_key[k] = ino
+            keys[ino] = k
+            paths[ino] = path
+            nlookup[ino] = 0
+        return ino
+
+    def drop(ino: int) -> None:
+        if ino != pyfuse3.ROOT_INODE and nlookup.get(ino, 1) <= 0:
+            nlookup.pop(ino, None)
+            paths.pop(ino, None)
+            by_key.pop(keys.pop(ino, None), None)
+
+    def path_of(ino: int) -> bytes:
+        try:
+            return paths[ino]
+        except KeyError:
+            raise pyfuse3.FUSEError(errno.ESTALE) from None
+
+    def list_dir(path: bytes) -> list[tuple[bytes, os.stat_result]]:
+        out = []
+        with os.scandir(path) as it:
+            for de in it:
+                try:
+                    out.append((de.name, de.stat(follow_symlinks=False)))
+                except OSError:
+                    continue
+        out.sort()
+        return out
+
+    class Ops(pyfuse3.Operations):
+        async def getattr(self, inode, ctx=None):
+            try:
+                st = os.lstat(path_of(inode))
+            except OSError as e:
+                raise err(e)
+            return attrs(inode, st)
+
+        async def lookup(self, parent, name, ctx=None):
+            if name in (b".", b".."):
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            p = os.path.join(path_of(parent), name)
+            try:
+                st = os.lstat(p)
+            except OSError as e:
+                raise err(e)
+            ino = ino_for(p, st)
+            nlookup[ino] += 1
+            return attrs(ino, st)
+
+        async def forget(self, inode_list):
+            for ino, n in inode_list:
+                if ino in nlookup:
+                    nlookup[ino] -= n
+                    drop(ino)
+
+        async def readlink(self, inode, ctx):
+            try:
+                return os.readlink(path_of(inode))
+            except OSError as e:
+                raise err(e)
+
+        async def opendir(self, inode, ctx):
+            p = path_of(inode)
+            try:
+                entries = await trio.to_thread.run_sync(list_dir, p)
+            except OSError as e:
+                raise err(e)
+            fh = counter[0]
+            counter[0] += 1
+            dirs[fh] = [(os.path.join(p, n), st) for n, st in entries]
+            return fh
+
+        async def readdir(self, fh, start_id, token):
+            entries = dirs.get(fh, [])
+            for i in range(start_id, len(entries)):
+                p, st = entries[i]
+                ino = ino_for(p, st)
+                if not pyfuse3.readdir_reply(token, os.path.basename(p), attrs(ino, st), i + 1):
+                    drop(ino)
+                    break
+                nlookup[ino] += 1
+
+        async def releasedir(self, fh):
+            dirs.pop(fh, None)
+
+        async def open(self, inode, flags, ctx):
+            if flags & (os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND):
+                raise pyfuse3.FUSEError(errno.EROFS)
+            try:
+                fd = os.open(path_of(inode), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)
+            except OSError as e:
+                raise err(e)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise pyfuse3.FUSEError(errno.EACCES)
+            files[fd] = inode
+            return pyfuse3.FileInfo(fh=fd, keep_cache=True)
+
+        async def read(self, fh, off, size):
+            try:
+                return await trio.to_thread.run_sync(os.pread, fh, size, off)
+            except OSError as e:
+                raise err(e)
+
+        async def release(self, fh):
+            if files.pop(fh, None) is not None:
+                os.close(fh)
+
+        async def statfs(self, ctx):
+            s = pyfuse3.StatvfsData()
+            try:
+                v = os.statvfs(root)
+            except OSError as e:
+                raise err(e)
+            for f in ("f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
+                      "f_favail", "f_namemax"):
+                setattr(s, f, getattr(v, f))
+            return s
+
+    opts = set(pyfuse3.default_options)
+    opts |= {"fsname=diskimg-view", "subtype=diskimg", "ro", "default_permissions", "nodev", "nosuid"}
+    if shared:                      # root serves it to the desktop user (tests run unprivileged)
+        opts.add("allow_other")
+    pyfuse3.init(Ops(), mountpoint, opts)
+    print("READY", flush=True)
+    try:
+        trio.run(pyfuse3.main)
+    finally:
+        pyfuse3.close(unmount=False)
+    return 0
+
+
+def start_view(src: Path, mp: Path) -> subprocess.Popen:
+    """Show src (a root-only mount) at mp, with every file readable by the desktop user (or root).
+    Returns the server process; raises ValueError when it cannot start."""
+    du = desktop_user()
+    uid, gid = (du[1], du[2]) if du else (0, 0)
+    mp.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logpath = LOG_DIR / f"{datetime.now():%Y%m%d-%H%M%S}_view.log"
+    with open(logpath, "a") as log:
+        p = subprocess.Popen([sys.executable, "-I", str(RUN_SCRIPT), "serve-view", str(src), str(mp),
+                              str(uid), str(gid)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log,
+                             start_new_session=True)
+    _reg(p)
+    import select
+    r, _, _ = select.select([p.stdout], [], [], 30)
+    line = p.stdout.readline().decode(errors="replace").strip() if r else ""
+    if line == "READY":
+        return p
+    if p.poll() is None:
+        p.kill()
+    p.wait()
+    _unreg(p)
+    try:
+        tail = logpath.read_text().strip().splitlines()[-1]
+    except (OSError, IndexError):
+        tail = "no output"
+    raise ValueError(f"the file view did not start: {tail}")
+
+
+def view_available() -> bool:
+    """Can start_view() work here (python-pyfuse3 + python-trio + FUSE)?"""
+    import importlib.util
+    return (os.path.exists("/dev/fuse") and importlib.util.find_spec("pyfuse3") is not None
+            and importlib.util.find_spec("trio") is not None)
+
+
+def stage_dir(tag: str) -> Path:
+    """A fresh root-only directory for a mount the desktop user sees only through start_view()."""
+    rd = Path("/run/diskimg")
+    rd.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(rd, 0o700)
+    d = Path(tempfile.mkdtemp(dir=rd, prefix=f"stage-{sanitize(tag)[:40]}-"))
+    return d
 
 
 _usage_lock = threading.Lock()
@@ -3127,14 +3456,29 @@ class JobRunner:
         self.browse_session: BrowseSession | None = None
         self.result: tuple[str, str] | None = None
         self.running = False
+        self.nas_src = self.nas_dst = None
+        if job.src and job.src_dev is None:
+            self.nas_src = net_share_of(existing_ancestor(Path(job.src)))
+        if job.dst and job.dst_dev is None and job.mode != "brw":
+            self.nas_dst = net_share_of(existing_ancestor(Path(job.dst)))
+        # live progress: re-sent every second, also while a write blocks (see _ticker)
+        self._live = None
+        self._live_t = 0.0
+        self._live_lock = threading.Lock()
 
     # ---- information for the UI ----
     def info_lines(self) -> list[str]:
         j = self.job
         info = [f"[b]{MODES[j.mode][0]}[/b]   [dim]{escape(engine_label(j.mode, j.method, j.compression, j.encrypt, j.manifest is not None))}[/]",
                 f"[dim]from[/] {escape(j.src_label)}"]
+        if self.nas_src:
+            info.append(f"[dim]    [/] [b $accent]NAS[/] the backup is read from the network share "
+                        f"{escape(self.nas_src)}")
         if j.mode != "chk":
             info.append(f"[dim]to  [/] {escape(j.dst_label)}")
+        if self.nas_dst:
+            info.append(f"[dim]    [/] [b $accent]NAS[/] the backup is written to the network share "
+                        f"{escape(self.nas_dst)}")
         if j.engine not in ("files", "files-check"):
             info.append(f"[dim]size[/] {human(j.size)} ({j.size:,} B)")
         if j.mapfile:
@@ -3209,6 +3553,8 @@ class JobRunner:
         self.sink.log(msg)
 
     def set_step(self, key: str, state: str) -> None:
+        if state != "run":
+            self.set_live(None)         # the progress of a finished step stays as it is
         if key in self.steps:
             self.steps[key] = state
             self.sink.step(key, state)
@@ -3219,10 +3565,44 @@ class JobRunner:
     def pairs(self, pairs: list) -> None:
         self.sink.pairs([(str(k), str(v), isinstance(v, Alert)) for k, v in pairs])
 
+    # ---- live progress ----
+    def set_live(self, fn) -> None:
+        """fn() re-sends the current progress; the ticker calls it when nothing else did for a
+        second (a write to a NAS can block for many seconds; the clock keeps running anyway)."""
+        with self._live_lock:
+            self._live = fn
+
+    def _ticker(self) -> None:
+        while self.running:
+            time.sleep(0.5)
+            with self._live_lock:
+                fn = self._live
+                if fn is None or time.monotonic() - self._live_t < 0.95:
+                    continue
+                self._live_t = time.monotonic()
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 - progress display must never break a job
+                    pass
+
+    def emit_progress(self, fn) -> None:
+        """Run fn (which sends progress) serialized with the ticker."""
+        with self._live_lock:
+            self._live_t = time.monotonic()
+            fn()
+
     def push_ddr_stats(self) -> None:
+        with self._live_lock:
+            self._live_t = time.monotonic()
+            self._push_ddr_stats()
+
+    def _push_ddr_stats(self) -> None:
         pairs = []
+        t0 = getattr(self, "_ddr_t0", None)
         for key, label in DDR_KEYS:
             val = self.stats.get(key, "-")
+            if key == "run time" and t0 is not None:
+                val = fmt_dur(time.monotonic() - t0)
             pairs.append((label, val, key in ("bad-sector", "bad areas", "read errors")
                           and val not in ("-", "0", "0 B")))
         self.sink.pairs(pairs)
@@ -3243,6 +3623,7 @@ class JobRunner:
         except OSError:
             self._logf = None
         result, style = "ERROR", "$error"
+        threading.Thread(target=self._ticker, daemon=True, name="diskimg-ticker").start()
         try:
             self._inhibit()
             if j.engine == "ddrescue":
@@ -3270,6 +3651,7 @@ class JobRunner:
                 if self._logf:
                     self._logf.write(traceback.format_exc())
         finally:
+            self.set_live(None)
             self.proc = None
             self.cur = None
             for lk in self.locks:
@@ -3486,6 +3868,8 @@ class JobRunner:
         ansi = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
         buf = ""
         last_push = 0.0
+        self._ddr_t0 = time.monotonic()
+        self.set_live(self._push_ddr_stats)
         try:
             while True:
                 try:
@@ -3509,7 +3893,9 @@ class JobRunner:
             rc = self.proc.wait()
             _unreg(self.proc)
             os.close(master)
+            self.set_live(None)
             self.push_ddr_stats()
+            self._ddr_t0 = None
         return rc
 
     def handle_ddr_line(self, s: str) -> None:
@@ -3678,28 +4064,39 @@ class JobRunner:
         if self.stop_requested or (bar == "verify" and self.skip_verify.is_set()):
             t.cancel.set()
 
-        def prog(tr: Transfer):
+        meter = RateMeter()
+        packing = self.job.mode == "d2i" and bool(self.job.compression)
+
+        def send(tr: Transfer):
             frac = max(0.0, min(1.0, tr.fraction()))
             overall = (self.w_done + weight * frac) / max(self.w_total, 1)
             el = time.monotonic() - self.phase_t0
-            rate = tr.bytes_in / max(time.monotonic() - tr.t0, 1e-3)
+            rate = meter.rate(tr.bytes_in)
             eta = el * (1 - overall) / overall if overall > 0.02 else None
             bad = self.bad_total + tr.src.bad_bytes()
-            pairs = [("Item", label), ("Item progress", f"{frac * 100:5.1f}%"),
-                     ("Elapsed", fmt_dur(el)),
-                     ("Read", human(tr.bytes_in)), ("Written", human(tr.bytes_out)),
-                     ("Remaining", fmt_dur(eta)),
-                     ("Rate", f"{human(rate)}/s"),
-                     ("Unreadable", Alert(human(bad)) if bad else "0 B"),
-                     ("Total", f"{overall * 100:5.1f}%")]
             if bar == "copy":
+                pairs = [("Item", label), ("Item progress", f"{frac * 100:5.1f}%"),
+                         ("Total", f"{overall * 100:5.1f}%"),
+                         ("Elapsed", fmt_dur(el)), ("Remaining", fmt_dur(eta)),
+                         ("Rate", f"{human(rate)}/s"),
+                         ("Read", human(tr.bytes_in)), ("Written", human(tr.bytes_out))]
+                if packing:
+                    pairs.append(("Compression", ratio_text(tr.bytes_in, tr.bytes_out)))
+                pairs.append(("Unreadable", Alert(human(bad)) if bad else "0 B"))
                 self.pairs(pairs)
                 self.sink.bar("copy", overall * 100)
             else:
                 self.sink.bar("verify", overall * 100,
                         f"{label}: {frac * 100:.1f}%   {human(rate)}/s   elapsed {fmt_dur(el)}   "
                         f"remaining {fmt_dur(eta)}")
-        ok = t.run(on_progress=prog)
+
+        def prog(tr: Transfer):
+            self.emit_progress(lambda: send(tr))
+        self.set_live(lambda: send(t))
+        try:
+            ok = t.run(on_progress=prog)
+        finally:
+            self.set_live(None)
         self.cur = None
         self.w_done += weight
         if not t.cancelled:
@@ -4599,32 +4996,48 @@ class JobRunner:
     #  chunked format (v3)
     # ======================================================================
     def chunk_progress(self, label: str, weight: int, bar: str):
-        t0 = time.monotonic()
+        """Progress callback for the chunked engine: prog(done, total, bad=0, written=None,
+        packed_in=None); written/packed_in (backups) = bytes stored so far / data they hold."""
         last = [0.0]
+        meter = RateMeter()
+        state: list = [0, 1, 0, None, None]
 
-        def prog(done: int, total: int, bad: int = 0) -> None:
+        def send() -> None:
+            done, total, bad, written, packed_in = state
             now = time.monotonic()
-            if now - last[0] < 0.3 and done < total:
-                return
-            last[0] = now
             frac = max(0.0, min(1.0, done / max(total, 1)))
             overall = (self.w_done + weight * frac) / max(self.w_total, 1)
             el = now - self.phase_t0
-            rate = done / max(now - t0, 1e-3) if total > 1000 else 0
+            rate = meter.rate(done) if total > 1000 else 0
             eta = el * (1 - overall) / overall if overall > 0.02 else None
             badt = self.bad_total + bad
             if bar == "copy":
-                self.pairs([
-                    ("Item", label), ("Item progress", f"{frac * 100:5.1f}%"), ("Elapsed", fmt_dur(el)),
-                    ("Processed", human(done) if total > 1000 else f"{done}/{total}"),
-                    ("Of", human(total) if total > 1000 else "chunks"), ("Remaining", fmt_dur(eta)),
-                    ("Rate", f"{human(rate)}/s" if rate else "-"),
-                    ("Unreadable", Alert(human(badt)) if badt else "0 B"),
-                    ("Total", f"{overall * 100:5.1f}%")])
+                pairs = [
+                    ("Item", label), ("Item progress", f"{frac * 100:5.1f}%"),
+                    ("Total", f"{overall * 100:5.1f}%"),
+                    ("Elapsed", fmt_dur(el)), ("Remaining", fmt_dur(eta)),
+                    ("Rate", f"{human(rate)}/s" if total > 1000 else "-"),
+                    ("Processed", (f"{human(done)} of {human(total)}") if total > 1000
+                     else f"{done}/{total} chunks")]
+                if written is not None:
+                    pairs.append(("Written", human(written)))
+                    pairs.append(("Compression", ratio_text(packed_in or 0, written)))
+                pairs.append(("Unreadable", Alert(human(badt)) if badt else "0 B"))
+                self.pairs(pairs)
                 self.sink.bar("copy", overall * 100)
             else:
                 self.sink.bar("verify", overall * 100,
                         f"{label}: {frac * 100:.1f}%   elapsed {fmt_dur(el)}   remaining {fmt_dur(eta)}")
+
+        def prog(done: int, total: int, bad: int = 0, written: int | None = None,
+                 packed_in: int | None = None) -> None:
+            state[:] = [done, total, bad, written, packed_in]
+            now = time.monotonic()
+            if now - last[0] < 0.3 and done < total:
+                return
+            last[0] = now
+            self.emit_progress(send)
+        self.set_live(send)
         return prog
 
     def _backup_chunked(self, it: dict, part: PartInfo, out: Path, level: int) -> tuple[bool, str]:
@@ -5109,12 +5522,33 @@ class JobRunner:
                             self.log(f"[$warning]{ttag}: {fstype} cannot be opened here, skipped.[/]")
                         continue
                     mp = root / sanitize(f"{ttag}_{label}" if label else f"{ttag}_{fstype}")
-                    err = mount_ro(node, fstype, str(mp))
-                    if err:
-                        self.log(f"[$error]{ttag} ({fstype}): mount failed: {escape(err)}[/]")
-                        continue
+                    viewed = fstype not in OWNERLESS_FS and view_available()
+                    if not viewed:
+                        if fstype not in OWNERLESS_FS:
+                            self.log(f"[$warning]{ttag}: files keep their owners - private files can "
+                                     "only be copied with 'Copy to...' (install python-pyfuse3 and "
+                                     "python-trio to make everything readable for you).[/]")
+                        err = mount_ro(node, fstype, str(mp))
+                        if err:
+                            self.log(f"[$error]{ttag} ({fstype}): mount failed: {escape(err)}[/]")
+                            continue
+                    else:
+                        # Linux filesystems keep their owners and permissions: mount them where only
+                        # root can look, and show them through a view in which everything is yours
+                        stage = stage_dir(f"{root.name}-{ttag}")
+                        err = mount_ro(node, fstype, str(stage))
+                        if err:
+                            self.log(f"[$error]{ttag} ({fstype}): mount failed: {escape(err)}[/]")
+                            continue
+                        sess.stages.append(str(stage))
+                        try:
+                            sess.views.append(start_view(stage, mp))
+                        except ValueError as e:
+                            self.log(f"[$error]{ttag} ({fstype}): {escape(str(e))}[/]")
+                            continue
                     sess.mounts.append((str(mp), f"{fstype} {label}".strip()))
-                    self.log(f"{ttag}: {fstype} {escape(label)} mounted read-only at {mp}")
+                    self.log(f"{ttag}: {fstype} {escape(label)} mounted read-only at {mp}"
+                             + (" (all files readable by you)" if viewed else ""))
             if not sess.mounts:
                 raise JobFailed("Nothing could be mounted.")
             self.set_step("mount", "done")
@@ -5825,7 +6259,9 @@ def plan_job(pi: PlanInput, devs: dict[str, Dev]) -> Job:
             mapfile = Path(str(rp) + ".map")
         elif method == "raw" and not pi.compression and free < size:
             raise ValueError(f"Not enough free space: needs {human(size)}, {human(free)} available.")
-        dst, dst_label = str(rp), f"{rp}  (on {fs}, {human(free)} free)"
+        net = net_share_of(rp.parent)
+        dst, dst_label = str(rp), (f"{rp}  (NAS: network share {net}, {human(free)} free)" if net
+                                   else f"{rp}  (on {fs}, {human(free)} free)")
 
     return Job(
         shrink=shrink if m == "i2d" else None,
@@ -6177,21 +6613,32 @@ def start_restic_mount(s: dict) -> tuple[BrowseSession | None, str | None]:
     """Mount all versions of a file backup set read-only. Returns (session, error)."""
     mp = FILES_MNT / sanitize(s["name"])
     if os.path.ismount(mp):
-        run(["fusermount3", "-u", str(mp)], timeout=30)
-    mp.mkdir(parents=True, exist_ok=True)
+        run(["umount", str(mp)], timeout=30)
+    # restic shows the files with their original owners: it mounts where only root can look, and
+    # the desktop user sees everything (readable) through a file view
+    if not view_available():
+        return None, "Opening versions needs FUSE support: install python-pyfuse3 and python-trio."
+    stage = stage_dir(f"restic-{s['name']}")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logp = LOG_DIR / f"restic-mount-{sanitize(s['name'])}.log"
     with open(logp, "a") as log:
-        p = subprocess.Popen(restic_base(s) + ["mount", "--allow-other", str(mp)],
+        p = subprocess.Popen(restic_base(s) + ["mount", str(stage)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     _reg(p)
     t0 = time.monotonic()
     while time.monotonic() - t0 < 90:
-        if (mp / "snapshots").is_dir():
-            return BrowseSession(name=f"{s['name']} (file backup versions)", source=s["repo"], root=mp,
-                                 procs=[p], fuse_mounts=[str(mp)],
+        if (stage / "snapshots").is_dir():
+            sess = BrowseSession(name=f"{s['name']} (file backup versions)", source=s["repo"], root=mp,
+                                 procs=[p], fuse_mounts=[str(stage)],
                                  note="Versions are under snapshots/<date> (latest = newest). "
-                                      "Read-only."), None
+                                      "Read-only.")
+            try:
+                sess.views.append(start_view(stage, mp))
+            except ValueError as e:
+                close_browse(sess, force=True)
+                return None, f"Could not open the versions: {e}"
+            sess.mounts.append((str(mp), "file backup versions"))
+            return sess, None
         if p.poll() is not None:
             break
         time.sleep(0.3)
@@ -6202,6 +6649,11 @@ def start_restic_mount(s: dict) -> tuple[BrowseSession | None, str | None]:
     except subprocess.TimeoutExpired:
         p.kill()
     _unreg(p)
+    run(["umount", "-l", str(stage)], timeout=30)
+    try:
+        stage.rmdir()
+    except OSError:
+        pass
     tail = ""
     try:
         tail = logp.read_text().strip().splitlines()[-1]
@@ -6241,7 +6693,7 @@ def shutdown_all(browse: BrowseSession | None, net_mounted: set[str], report=pri
             return
         _shutdown_done = True
         cancel_usage()
-        cleanup_procs(exclude=set(browse.procs) if browse is not None else None)
+        cleanup_procs(exclude=set(browse.procs) | set(browse.views) if browse is not None else None)
         if browse is not None:
             for e in close_browse(browse, force=True):
                 report(f"diskimg: could not unmount {e}")
